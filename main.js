@@ -1,8 +1,5 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
-import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
-import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
-import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -21,12 +18,8 @@ const HAND_ANCHOR_X_FRAC = 0.1;
 /** Fracción del alto: negativo = por debajo del centro. Más negativo = más abajo (apoyada, no “flotando”). */
 const HAND_ANCHOR_Y_FRAC = -0.4;
 const HAND_EXTENDED_MS = 200;
-const LASER_HAND_DEPTH = 0.42;
 const HAND_KICK_X = 14;
 const HAND_KICK_Y = 18;
-
-/** Haz de telequinesis visible (línea cian). false = sin “barra” en pantalla; la mecánica sigue igual. */
-const SHOW_TELEKINESIS_BEAM = false;
 
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -28, 0) });
 world.allowSleep = true;
@@ -309,36 +302,6 @@ const cubePositions = [
 
 cubePositions.forEach((p, i) => addCube(p[0], p[1], p[2], boxColors[i % boxColors.length]));
 
-const laserRayObjects = [groundMesh, ...cubeMeshes];
-
-const laserRayOrigin = new THREE.Vector3();
-const laserRayDir = new THREE.Vector3();
-const laserRayEnd = new THREE.Vector3();
-const ndcHand = new THREE.Vector3();
-const unprojScratch = new THREE.Vector3();
-
-const laserGeo = new LineSegmentsGeometry();
-const laserPosArray = new Float32Array(6);
-laserGeo.setPositions(laserPosArray);
-const laserLineBuffer = laserGeo.attributes.instanceStart.data;
-
-const laserMat = new LineMaterial({
-  color: 0x00fff4,
-  linewidth: 14,
-  transparent: true,
-  opacity: 1,
-  depthWrite: false,
-  depthTest: true,
-  blending: THREE.AdditiveBlending,
-  toneMapped: false,
-});
-laserMat.resolution.set(window.innerWidth, window.innerHeight);
-
-const laserLine = new LineSegments2(laserGeo, laserMat);
-laserLine.visible = false;
-laserLine.frustumCulled = false;
-scene.add(laserLine);
-
 let grabbedBody = null;
 let grabGlowMesh = null;
 
@@ -377,17 +340,6 @@ function updateGrabGlow(aimMesh) {
     aimMesh.material.emissiveIntensity = GRAB_GLOW_INTENSITY;
     grabGlowMesh = aimMesh;
   }
-}
-
-function worldPointFromScreenPixel(px, py, depthAlongRay) {
-  ndcHand.set(
-    (px / window.innerWidth) * 2 - 1,
-    -(py / window.innerHeight) * 2 + 1,
-    0.5
-  );
-  ndcHand.unproject(camera);
-  unprojScratch.copy(ndcHand).sub(camera.position).normalize();
-  laserRayOrigin.copy(camera.position).addScaledVector(unprojScratch, depthAlongRay);
 }
 
 window.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -523,33 +475,6 @@ function animate() {
   syncMeshesFromPhysics();
 
   if (controls.isLocked) {
-    if (SHOW_TELEKINESIS_BEAM) {
-      const px = handSprite.position.x + window.innerWidth / 2;
-      const py = window.innerHeight / 2 - handSprite.position.y;
-      worldPointFromScreenPixel(px, py, LASER_HAND_DEPTH);
-
-      raycaster.setFromCamera(ndcCenter, camera);
-      const laserHits = raycaster.intersectObjects(laserRayObjects, false);
-      if (laserHits.length > 0) {
-        laserRayEnd.copy(laserHits[0].point);
-      } else {
-        camera.getWorldDirection(laserRayDir);
-        laserRayEnd
-          .copy(laserRayOrigin)
-          .addScaledVector(laserRayDir, GRAB_REACH);
-      }
-      laserPosArray[0] = laserRayOrigin.x;
-      laserPosArray[1] = laserRayOrigin.y;
-      laserPosArray[2] = laserRayOrigin.z;
-      laserPosArray[3] = laserRayEnd.x;
-      laserPosArray[4] = laserRayEnd.y;
-      laserPosArray[5] = laserRayEnd.z;
-      laserLineBuffer.needsUpdate = true;
-      laserLine.visible = true;
-    } else {
-      laserLine.visible = false;
-    }
-
     const aimMesh = getLookedAtGrabbableMesh();
     const grabbable = aimMesh !== null;
     crosshairMat.color.set(grabbable ? 0xff3048 : 0xffffff);
@@ -571,7 +496,6 @@ function animate() {
 
     sceneHUD.visible = true;
   } else {
-    laserLine.visible = false;
     sceneHUD.visible = false;
     crosshairMat.color.set(0xffffff);
     clearGrabGlow();
@@ -598,7 +522,6 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
   composer.setSize(window.innerWidth, window.innerHeight);
-  laserMat.resolution.set(window.innerWidth, window.innerHeight);
   updateHudLayout();
 });
 
