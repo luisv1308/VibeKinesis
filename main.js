@@ -51,9 +51,11 @@ const DRONE_FLASH_SEC = 0.12;
 const MAX_DRONES = 36;
 
 const HAND_SIZE_PX = 292;
-/** Mano derecha en FP: fracción del ancho a la derecha del centro (0 = centro). */
-const HAND_ANCHOR_X_FRAC = 0.1;
-/** Fracción del alto: negativo = por debajo del centro. Más negativo = más abajo (apoyada, no “flotando”). */
+/** Mano derecha (telequinesis): fracción del ancho a la derecha del centro. */
+const HAND_RIGHT_ANCHOR_X_FRAC = 0.1;
+/** Mano izquierda (escudo): espejo de la textura de la derecha, simétrica en X. */
+const HAND_LEFT_ANCHOR_X_FRAC = -0.1;
+/** Fracción del alto: negativo = por debajo del centro. */
 const HAND_ANCHOR_Y_FRAC = -0.4;
 const HAND_EXTENDED_MS = 200;
 const HAND_KICK_X = 14;
@@ -193,13 +195,40 @@ function makeHandPlaceholderTexture(label) {
 let texHandOpen = makeHandPlaceholderTexture('OPEN');
 let texHandClose = makeHandPlaceholderTexture('CLOSE');
 let texHandExtended = makeHandPlaceholderTexture('PUSH');
-let lastHandVisual = 'open';
+
+/** Espejo horizontal real (el scale negativo del sprite no invierte bien la textura). */
+function createMirroredHandTexture(source) {
+  const t = source.clone();
+  t.wrapS = THREE.RepeatWrapping;
+  t.repeat.set(-1, 1);
+  t.offset.set(1, 0);
+  t.needsUpdate = true;
+  return t;
+}
+
+let texHandOpenL = createMirroredHandTexture(texHandOpen);
+let texHandCloseL = createMirroredHandTexture(texHandClose);
+let texHandExtendedL = createMirroredHandTexture(texHandExtended);
+
+let lastRightHandVisual = 'open';
+let lastLeftHandVisual = 'open';
+
+function applyHandTextureToMaterial(mat, visual, forLeftHand) {
+  if (forLeftHand) {
+    if (visual === 'open') mat.map = texHandOpenL;
+    else if (visual === 'close') mat.map = texHandCloseL;
+    else mat.map = texHandExtendedL;
+  } else {
+    if (visual === 'open') mat.map = texHandOpen;
+    else if (visual === 'close') mat.map = texHandClose;
+    else mat.map = texHandExtended;
+  }
+  mat.needsUpdate = true;
+}
 
 function syncHandMaterialMap() {
-  if (lastHandVisual === 'open') handMat.map = texHandOpen;
-  else if (lastHandVisual === 'close') handMat.map = texHandClose;
-  else handMat.map = texHandExtended;
-  handMat.needsUpdate = true;
+  applyHandTextureToMaterial(rightHandMat, lastRightHandVisual, false);
+  applyHandTextureToMaterial(leftHandMat, lastLeftHandVisual, true);
 }
 
 function loadHandPng(url, onTex) {
@@ -217,15 +246,21 @@ function loadHandPng(url, onTex) {
 
 loadHandPng(`${assetBase}single_hand_open.png`, (t) => {
   texHandOpen = t;
+  texHandOpenL.dispose();
+  texHandOpenL = createMirroredHandTexture(t);
 });
 loadHandPng(`${assetBase}single_hand_close.png`, (t) => {
   texHandClose = t;
+  texHandCloseL.dispose();
+  texHandCloseL = createMirroredHandTexture(t);
 });
 loadHandPng(`${assetBase}original_hand_extended.png`, (t) => {
   texHandExtended = t;
+  texHandExtendedL.dispose();
+  texHandExtendedL = createMirroredHandTexture(t);
 });
 
-const handMat = new THREE.SpriteMaterial({
+const rightHandMat = new THREE.SpriteMaterial({
   map: texHandOpen,
   transparent: true,
   depthTest: false,
@@ -233,12 +268,26 @@ const handMat = new THREE.SpriteMaterial({
   sizeAttenuation: false,
   alphaTest: 0.01,
 });
-const handSprite = new THREE.Sprite(handMat);
-handSprite.scale.set(HAND_SIZE_PX, HAND_SIZE_PX, 1);
-handSprite.renderOrder = 5;
-sceneHUD.add(handSprite);
+const rightHandSprite = new THREE.Sprite(rightHandMat);
+rightHandSprite.scale.set(HAND_SIZE_PX, HAND_SIZE_PX, 1);
+rightHandSprite.renderOrder = 5;
+sceneHUD.add(rightHandSprite);
 
-let handBaseX = 0;
+const leftHandMat = new THREE.SpriteMaterial({
+  map: texHandOpen,
+  transparent: true,
+  depthTest: false,
+  depthWrite: false,
+  sizeAttenuation: false,
+  alphaTest: 0.01,
+});
+const leftHandSprite = new THREE.Sprite(leftHandMat);
+leftHandSprite.scale.set(HAND_SIZE_PX, HAND_SIZE_PX, 1);
+leftHandSprite.renderOrder = 5;
+sceneHUD.add(leftHandSprite);
+
+let handRightBaseX = 0;
+let handLeftBaseX = 0;
 let handBaseY = 0;
 let handShakeX = 0;
 let handShakeY = 0;
@@ -253,9 +302,15 @@ function updateHudLayout() {
   hudCamera.bottom = -h / 2;
   hudCamera.updateProjectionMatrix();
 
-  handBaseX = w * HAND_ANCHOR_X_FRAC;
+  handRightBaseX = w * HAND_RIGHT_ANCHOR_X_FRAC;
+  handLeftBaseX = w * HAND_LEFT_ANCHOR_X_FRAC;
   handBaseY = h * HAND_ANCHOR_Y_FRAC;
-  handSprite.position.set(handBaseX + handShakeX, handBaseY + handShakeY, 0);
+  rightHandSprite.position.set(
+    handRightBaseX + handShakeX,
+    handBaseY + handShakeY,
+    0
+  );
+  leftHandSprite.position.set(handLeftBaseX, handBaseY, 0);
 }
 
 updateHudLayout();
@@ -1326,7 +1381,12 @@ function animate() {
     handShakeY *= shakeDecay;
   }
 
-  handSprite.position.set(handBaseX + handShakeX, handBaseY + handShakeY, 0);
+  rightHandSprite.position.set(
+    handRightBaseX + handShakeX,
+    handBaseY + handShakeY,
+    0
+  );
+  leftHandSprite.position.set(handLeftBaseX, handBaseY, 0);
 
   if (controls.isLocked && !isPaused) {
     spawnTimer += dt;
@@ -1380,24 +1440,28 @@ function animate() {
       clearGrabGlow();
     }
 
-    let desired = 'open';
+    let desiredRight = 'open';
     if (!isPaused) {
       if (grabbedBody !== null) {
-        desired = 'close';
-      } else if (shieldPressed) {
-        desired = 'extended';
+        desiredRight = 'close';
       } else if (performance.now() < handExtendedUntil) {
-        desired = 'extended';
+        desiredRight = 'extended';
       } else {
-        desired = 'open';
+        desiredRight = 'open';
       }
     }
-    if (desired !== lastHandVisual) {
-      if (desired === 'open') handMat.map = texHandOpen;
-      else if (desired === 'close') handMat.map = texHandClose;
-      else handMat.map = texHandExtended;
-      handMat.needsUpdate = true;
-      lastHandVisual = desired;
+    if (desiredRight !== lastRightHandVisual) {
+      applyHandTextureToMaterial(rightHandMat, desiredRight, false);
+      lastRightHandVisual = desiredRight;
+    }
+
+    let desiredLeft = 'open';
+    if (!isPaused && shieldPressed) {
+      desiredLeft = 'extended';
+    }
+    if (desiredLeft !== lastLeftHandVisual) {
+      applyHandTextureToMaterial(leftHandMat, desiredLeft, true);
+      lastLeftHandVisual = desiredLeft;
     }
 
     sceneHUD.visible = true;
