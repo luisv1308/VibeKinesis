@@ -389,6 +389,9 @@ const SHIELD_RING_INNER2_INNER = SHIELD_RING_OUTER * 0.48;
 /** Mitad del grosor del plano de captura (más generoso que el anillo visual). */
 const SHIELD_CAPTURE_THICK = 1.15;
 const SHIELD_DROP_SEC = 2;
+/** Opacidad del proyectil pegado al escudo (ver a través hacia la mira). */
+const SHIELD_STUCK_PROJ_OPACITY = 0.24;
+const SHIELD_STUCK_PROJ_EMISSIVE_MULT = 0.4;
 
 const magnetShieldGroup = new THREE.Group();
 {
@@ -706,9 +709,40 @@ function onProjectileCollide(ent, other) {
   }
 }
 
+function applyProjectileShieldStuckVisual(ent) {
+  const mat = ent.visualMesh.material;
+  if (!ent.shieldStuckMatSave) {
+    ent.shieldStuckMatSave = {
+      opacity: mat.opacity,
+      transparent: mat.transparent,
+      depthWrite: mat.depthWrite,
+      emissiveIntensity: mat.emissiveIntensity,
+    };
+  }
+  mat.transparent = true;
+  mat.opacity = SHIELD_STUCK_PROJ_OPACITY;
+  mat.depthWrite = false;
+  mat.emissiveIntensity =
+    ent.shieldStuckMatSave.emissiveIntensity * SHIELD_STUCK_PROJ_EMISSIVE_MULT;
+  mat.needsUpdate = true;
+}
+
+function restoreProjectileShieldStuckVisual(ent) {
+  const s = ent.shieldStuckMatSave;
+  if (!s) return;
+  const mat = ent.visualMesh.material;
+  mat.opacity = s.opacity;
+  mat.transparent = s.transparent;
+  mat.depthWrite = s.depthWrite;
+  mat.emissiveIntensity = s.emissiveIntensity;
+  delete ent.shieldStuckMatSave;
+  mat.needsUpdate = true;
+}
+
 function releaseShieldStuckProjectiles() {
   for (const ent of enemyProjectiles) {
     if (!ent.shieldStuck) continue;
+    restoreProjectileShieldStuckVisual(ent);
     ent.shieldStuck = false;
     ent.shieldDropping = true;
     ent.shieldDropSec = SHIELD_DROP_SEC;
@@ -1023,6 +1057,7 @@ function updateShieldStuckProjectiles() {
     b.position.set(_pinShieldPos.x, _pinShieldPos.y, _pinShieldPos.z);
     b.velocity.set(0, 0, 0);
     b.angularVelocity.set(0, 0, 0);
+    applyProjectileShieldStuckVisual(ent);
   }
 }
 
@@ -1181,6 +1216,7 @@ window.addEventListener('mousedown', (e) => {
     const peGrab = body.userData?.projectileEnt;
     if (peGrab) {
       if (peGrab.shieldStuck) {
+        restoreProjectileShieldStuckVisual(peGrab);
         peGrab.shieldStuck = false;
         delete peGrab.shieldStickU;
         delete peGrab.shieldStickV;
