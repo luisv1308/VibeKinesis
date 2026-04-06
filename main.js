@@ -7,7 +7,8 @@ import * as CANNON from 'cannon-es';
 
 const PLAYER_EYE_HEIGHT = 1.65;
 const MOVE_SPEED = 12;
-const GRAB_REACH = 40;
+/** Alcance máximo del rayo de telequinesis (más pequeño = “escudo” más ajustado). */
+const GRAB_REACH = 18;
 const PULL_GAIN = 10;
 const PULL_MAX_SPEED = 28;
 const LAUNCH_SPEED = 42;
@@ -23,7 +24,6 @@ const BULLET_TIME_NEAR_DIST = 5;
 const BULLET_TIME_SCALE = 0.2;
 /** Más lento = tiempo de reacción y telequinesis jugables. */
 const PROJ_ENEMY_SPEED = 19;
-const PROJ_MAX_LIFE = 14;
 const DRONE_ATTACK_MIN_DIST = 10;
 const DRONE_ATTACK_MAX_DIST = 20;
 const DRONE_FIRE_COOLDOWN = 3;
@@ -58,6 +58,15 @@ const HAND_ANCHOR_Y_FRAC = -0.4;
 const HAND_EXTENDED_MS = 200;
 const HAND_KICK_X = 14;
 const HAND_KICK_Y = 18;
+
+/** Distancia recorrida máxima por proyectil enemigo (trayectoria recta); al superarla se elimina. */
+const PROJ_MAX_PATH_TRAVEL = 85;
+/** Segundos máximos de vida (respaldo). */
+const PROJ_MAX_LIFE = 40;
+/** Mismo límite horizontal que el jugador (cámara clamp ±ARENA_HALF). Fuera → se elimina el disparo enemigo. */
+const ARENA_HALF = 58;
+const ARENA_Y_MIN = -2;
+const ARENA_Y_MAX = 80;
 
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -28, 0) });
 world.allowSleep = true;
@@ -276,11 +285,18 @@ controls.addEventListener('lock', () => {
 
 controls.addEventListener('unlock', () => {
   blocker.classList.remove('hidden');
+  shieldPressed = false;
+  releaseShieldStuckProjectiles();
   if (grabbedBody) {
     const mesh = meshFromBody(grabbedBody);
     if (mesh) clearGrabTransparency(mesh);
     grabbedBody = null;
   }
+});
+
+window.addEventListener('blur', () => {
+  shieldPressed = false;
+  releaseShieldStuckProjectiles();
 });
 
 const ambient = new THREE.AmbientLight(0x6a7090, 0.45);
@@ -309,6 +325,46 @@ groundMesh.rotation.x = -Math.PI / 2;
 groundMesh.receiveShadow = true;
 scene.add(groundMesh);
 
+/** Escudo magnético en el plano de la vista (un poco delante del jugador). */
+const SHIELD_VIEW_DIST = 2.65;
+const SHIELD_RING_OUTER = 0.52;
+const SHIELD_RING_INNER = SHIELD_RING_OUTER - 0.07;
+const SHIELD_RING_INNER2_OUTER = SHIELD_RING_OUTER * 0.52;
+const SHIELD_RING_INNER2_INNER = SHIELD_RING_OUTER * 0.48;
+/** Mitad del grosor del plano de captura (más generoso que el anillo visual). */
+const SHIELD_CAPTURE_THICK = 1.15;
+const SHIELD_DROP_SEC = 2;
+
+const magnetShieldGroup = new THREE.Group();
+{
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(SHIELD_RING_INNER, SHIELD_RING_OUTER, 96),
+    new THREE.MeshBasicMaterial({
+      color: 0x55f0ff,
+      transparent: true,
+      opacity: 0.38,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    })
+  );
+  magnetShieldGroup.add(ring);
+
+  const inner = new THREE.Mesh(
+    new THREE.RingGeometry(SHIELD_RING_INNER2_INNER, SHIELD_RING_INNER2_OUTER, 72),
+    new THREE.MeshBasicMaterial({
+      color: 0x00b4d8,
+      transparent: true,
+      opacity: 0.22,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    })
+  );
+  magnetShieldGroup.add(inner);
+}
+magnetShieldGroup.visible = false;
+magnetShieldGroup.renderOrder = 2;
+scene.add(magnetShieldGroup);
+
 const groundShape = new CANNON.Plane();
 const groundBody = new CANNON.Body({ mass: 0 });
 groundBody.addShape(groundShape);
@@ -325,20 +381,20 @@ const cubeMeshes = [];
 const projectileMeshes = [];
 const enemyProjectiles = [];
 
-/** Los proyectiles no deben caer como balística: la gravedad del mundo los hunde hacia el suelo antes de llegar al jugador. */
-world.addEventListener('preStep', () => {
-  const gy = world.gravity.y;
-  for (const ent of enemyProjectiles) {
-    if (ent.dead) continue;
-    ent.body.force.y += -gy * ent.body.mass;
-  }
-});
-
 const projGeo = new THREE.SphereGeometry(PROJ_RADIUS, 12, 12);
 const pickGeo = new THREE.SphereGeometry(PROJ_PICK_RADIUS, 16, 16);
 const raycaster = new THREE.Raycaster();
 const ndcCenter = new THREE.Vector2(0, 0);
 const _tmpBulletNear = new THREE.Vector3();
+const _shieldOffsetLocal = new THREE.Vector3();
+const _shieldCenter = new THREE.Vector3();
+const _shieldNormal = new THREE.Vector3();
+const _toProjShield = new THREE.Vector3();
+const _radialShield = new THREE.Vector3();
+const _shieldBasisRight = new THREE.Vector3();
+const _shieldBasisUp = new THREE.Vector3();
+const _pinShieldPos = new THREE.Vector3();
+const _worldUpY = new THREE.Vector3(0, 1, 0);
 
 class EnemyBullet {
   constructor(ent) {
@@ -564,6 +620,8 @@ function syncDroneMeshes() {
 
 function captureProjectileVisual(ent) {
   ent.state = 'friendly';
+  ent.pathTraveled = 0;
+  delete ent.enemyDir;
   const mat = ent.visualMesh.material;
   mat.color.setHex(0x22eeff);
   mat.emissive.setHex(0x00ccff);
@@ -574,10 +632,12 @@ function captureProjectileVisual(ent) {
 function onProjectileCollide(ent, other) {
   if (!ent || ent.dead) return;
   if (other === groundBody && ent.state === 'enemy') {
+    if (ent.shieldStuck) return;
     removeProjectile(ent);
     return;
   }
   if (other === playerBody && ent.state === 'enemy') {
+    if (ent.shieldStuck) return;
     removeProjectile(ent);
     triggerDamageFeedback();
     return;
@@ -588,6 +648,22 @@ function onProjectileCollide(ent, other) {
       killDrone(drone);
       removeProjectile(ent);
     }
+  }
+}
+
+function releaseShieldStuckProjectiles() {
+  for (const ent of enemyProjectiles) {
+    if (!ent.shieldStuck) continue;
+    ent.shieldStuck = false;
+    ent.shieldDropping = true;
+    ent.shieldDropSec = SHIELD_DROP_SEC;
+    delete ent.enemyDir;
+    delete ent.shieldStickU;
+    delete ent.shieldStickV;
+    const b = ent.body;
+    b.wakeUp();
+    b.velocity.set(0, 0, 0);
+    b.angularVelocity.set(0, 0, 0);
   }
 }
 
@@ -684,7 +760,10 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz) {
     body,
     state: 'enemy',
     age: 0,
+    pathTraveled: 0,
     dead: false,
+    /** Dirección de vuelo fija (sin gravedad; se re-aplica cada frame). */
+    enemyDir: { x: nx, y: ny, z: nz },
   };
   new EnemyBullet(ent);
 
@@ -727,13 +806,168 @@ function updateProjectileLife(dt) {
     const ent = enemyProjectiles[i];
     if (ent.dead) continue;
     ent.age += dt;
+    if (ent.shieldStuck) {
+      continue;
+    }
+    if (ent.shieldDropping) {
+      ent.shieldDropSec -= dt;
+      if (ent.shieldDropSec <= 0) {
+        removeProjectile(ent);
+      }
+      continue;
+    }
+    const p = ent.body.position;
     if (
-      ent.age > PROJ_MAX_LIFE &&
       ent.state === 'enemy' &&
-      grabbedBody !== ent.body
+      grabbedBody !== ent.body &&
+      (Math.abs(p.x) > ARENA_HALF ||
+        Math.abs(p.z) > ARENA_HALF ||
+        p.y < ARENA_Y_MIN ||
+        p.y > ARENA_Y_MAX)
     ) {
       removeProjectile(ent);
+      continue;
     }
+    if (grabbedBody !== ent.body) {
+      const spd =
+        ent.state === 'enemy' && ent.enemyDir
+          ? PROJ_ENEMY_SPEED
+          : ent.body.velocity.length();
+      ent.pathTraveled += spd * dt;
+      if (ent.pathTraveled > PROJ_MAX_PATH_TRAVEL) {
+        removeProjectile(ent);
+        continue;
+      }
+    }
+    if (ent.age > PROJ_MAX_LIFE && grabbedBody !== ent.body) {
+      removeProjectile(ent);
+    }
+  }
+}
+
+/** Antes de integrar: quita la gravedad global del `force` (solo disparos enemigos). */
+function cancelEnemyProjectileGravity() {
+  const g = world.gravity;
+  const gx = g.x;
+  const gy = g.y;
+  const gz = g.z;
+  for (const ent of enemyProjectiles) {
+    if (ent.dead || ent.state !== 'enemy' || !ent.enemyDir) continue;
+    if (ent.shieldStuck || ent.shieldDropping) continue;
+    if (grabbedBody === ent.body) continue;
+    const b = ent.body;
+    const m = b.mass;
+    b.force.x -= m * gx;
+    b.force.y -= m * gy;
+    b.force.z -= m * gz;
+  }
+}
+
+/** Después del paso: velocidad constante en línea recta (sin caída ni rebote). */
+function enforceEnemyProjectileStraightFlight() {
+  for (const ent of enemyProjectiles) {
+    if (ent.dead || ent.state !== 'enemy' || !ent.enemyDir) continue;
+    if (ent.shieldStuck || ent.shieldDropping) continue;
+    if (grabbedBody === ent.body) continue;
+    const d = ent.enemyDir;
+    const b = ent.body;
+    b.velocity.set(
+      d.x * PROJ_ENEMY_SPEED,
+      d.y * PROJ_ENEMY_SPEED,
+      d.z * PROJ_ENEMY_SPEED
+    );
+    b.angularVelocity.set(0, 0, 0);
+  }
+}
+
+world.addEventListener('preStep', cancelEnemyProjectileGravity);
+world.addEventListener('postStep', enforceEnemyProjectileStraightFlight);
+
+function computeShieldFrame() {
+  camera.getWorldDirection(_shieldNormal);
+  _shieldOffsetLocal.set(0, -0.1, -SHIELD_VIEW_DIST);
+  _shieldOffsetLocal.applyQuaternion(camera.quaternion);
+  _shieldCenter.copy(camera.position).add(_shieldOffsetLocal);
+  _shieldBasisRight.crossVectors(_worldUpY, _shieldNormal);
+  if (_shieldBasisRight.lengthSq() < 1e-8) {
+    _shieldBasisRight.set(1, 0, 0);
+  } else {
+    _shieldBasisRight.normalize();
+  }
+  _shieldBasisUp.crossVectors(_shieldNormal, _shieldBasisRight).normalize();
+}
+
+/** Escudo activo: atrapa proyectiles en el disco y los fija; al soltar caen con gravedad ~2 s. */
+function updateShieldStuckProjectiles() {
+  if (isPaused || !controls.isLocked) return;
+  if (!shieldPressed) {
+    for (const ent of enemyProjectiles) {
+      if (ent.shieldStuck) {
+        releaseShieldStuckProjectiles();
+        break;
+      }
+    }
+    return;
+  }
+  computeShieldFrame();
+
+  const maxStickR = SHIELD_RING_OUTER - PROJ_RADIUS * 0.35;
+  const captureR = SHIELD_RING_OUTER + PROJ_RADIUS + 0.5;
+  for (const ent of enemyProjectiles) {
+    if (ent.dead || ent.state !== 'enemy' || grabbedBody === ent.body) continue;
+    if (ent.shieldStuck || ent.shieldDropping) continue;
+
+    const p = ent.body.position;
+    const v = ent.body.velocity;
+    _toProjShield.set(
+      p.x - _shieldCenter.x,
+      p.y - _shieldCenter.y,
+      p.z - _shieldCenter.z
+    );
+    const distPlane = Math.abs(_toProjShield.dot(_shieldNormal));
+    if (distPlane > SHIELD_CAPTURE_THICK) continue;
+
+    _radialShield.copy(_toProjShield);
+    _radialShield.addScaledVector(
+      _shieldNormal,
+      -_toProjShield.dot(_shieldNormal)
+    );
+    if (_radialShield.length() > captureR) continue;
+
+    if (v.lengthSquared() > 1) {
+      const vd =
+        v.x * _shieldNormal.x +
+        v.y * _shieldNormal.y +
+        v.z * _shieldNormal.z;
+      if (vd > 0.35) continue;
+    }
+
+    let su = _radialShield.dot(_shieldBasisRight);
+    let sv = _radialShield.dot(_shieldBasisUp);
+    const rStick = Math.hypot(su, sv);
+    if (rStick > maxStickR && rStick > 1e-6) {
+      const s = maxStickR / rStick;
+      su *= s;
+      sv *= s;
+    }
+    ent.shieldStuck = true;
+    ent.shieldStickU = su;
+    ent.shieldStickV = sv;
+  }
+
+  for (const ent of enemyProjectiles) {
+    if (!ent.shieldStuck || ent.shieldDropping) continue;
+    const su = ent.shieldStickU;
+    const sv = ent.shieldStickV;
+    const bump = PROJ_RADIUS + 0.06;
+    _pinShieldPos.copy(_shieldCenter);
+    _pinShieldPos.addScaledVector(_shieldBasisRight, su);
+    _pinShieldPos.addScaledVector(_shieldBasisUp, sv);
+    _pinShieldPos.addScaledVector(_shieldNormal, bump);
+    const b = ent.body;
+    b.position.set(_pinShieldPos.x, _pinShieldPos.y, _pinShieldPos.z);
+    b.velocity.set(0, 0, 0);
+    b.angularVelocity.set(0, 0, 0);
   }
 }
 
@@ -782,6 +1016,8 @@ let spawnTimer = 0;
 
 let grabbedBody = null;
 let grabGlowMesh = null;
+/** Clic izquierdo mantenido: escudo magnético + gesto de mano. */
+let shieldPressed = false;
 
 const GRAB_GLOW_COLOR = 0x9966ff;
 const GRAB_GLOW_INTENSITY = 0.55;
@@ -880,10 +1116,35 @@ function clearGrabTransparency(mesh) {
 window.addEventListener('contextmenu', (e) => e.preventDefault());
 
 window.addEventListener('mousedown', (e) => {
+  if (e.button === 0) {
+    if (!isPaused && controls.isLocked) shieldPressed = true;
+    return;
+  }
   if (isPaused || e.button !== 2 || !controls.isLocked) return;
   const body = getLookedAtGrabbableBody();
   if (body) {
-    if (body.userData?.projectileEnt) {
+    const peGrab = body.userData?.projectileEnt;
+    if (peGrab) {
+      if (peGrab.shieldStuck) {
+        peGrab.shieldStuck = false;
+        delete peGrab.shieldStickU;
+        delete peGrab.shieldStickV;
+      }
+      if (peGrab.shieldDropping) {
+        peGrab.shieldDropping = false;
+        delete peGrab.shieldDropSec;
+        if (peGrab.state === 'enemy') {
+          const vv = body.velocity;
+          const len = Math.hypot(vv.x, vv.y, vv.z);
+          if (len > 0.8) {
+            const inv = 1 / len;
+            peGrab.enemyDir = { x: vv.x * inv, y: vv.y * inv, z: vv.z * inv };
+          } else {
+            camera.getWorldDirection(aimDir);
+            peGrab.enemyDir = { x: aimDir.x, y: aimDir.y, z: aimDir.z };
+          }
+        }
+      }
       physicsTimeScale = 1;
     }
     clearGrabGlow();
@@ -901,6 +1162,10 @@ window.addEventListener('mousedown', (e) => {
 });
 
 window.addEventListener('mouseup', (e) => {
+  if (e.button === 0) {
+    shieldPressed = false;
+    releaseShieldStuckProjectiles();
+  }
   if (isPaused || e.button !== 2) return;
   if (grabbedBody) {
     const mesh = meshFromBody(grabbedBody);
@@ -910,6 +1175,9 @@ window.addEventListener('mouseup', (e) => {
     const dir = new THREE.Vector3();
     camera.getWorldDirection(dir);
     const pe = grabbedBody.userData?.projectileEnt;
+    if (pe) {
+      pe.pathTraveled = 0;
+    }
     const launchSpeed = pe
       ? LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT
       : LAUNCH_SPEED;
@@ -945,6 +1213,8 @@ window.addEventListener('keydown', (e) => {
       pauseOverlayEl.setAttribute('aria-hidden', isPaused ? 'false' : 'true');
     }
     if (isPaused) {
+      shieldPressed = false;
+      releaseShieldStuckProjectiles();
       keys.KeyW = false;
       keys.KeyA = false;
       keys.KeyS = false;
@@ -1084,13 +1354,25 @@ function animate() {
     syncMeshesFromPhysics();
     syncDroneMeshes();
     syncProjectileMeshes();
+    updateShieldStuckProjectiles();
     updateDronesDeath(dt);
   }
 
   if (controls.isLocked) {
+    const showShield = !isPaused && shieldPressed;
+    magnetShieldGroup.visible = showShield;
+    if (showShield) {
+      _shieldOffsetLocal.set(0, -0.1, -SHIELD_VIEW_DIST);
+      _shieldOffsetLocal.applyQuaternion(camera.quaternion);
+      magnetShieldGroup.position.copy(camera.position);
+      magnetShieldGroup.position.add(_shieldOffsetLocal);
+      magnetShieldGroup.quaternion.copy(camera.quaternion);
+    }
+
+    let grabbable = false;
     if (!isPaused) {
       const aimMesh = getLookedAtGrabbableMesh();
-      const grabbable = aimMesh !== null;
+      grabbable = aimMesh !== null;
       crosshairMat.color.set(grabbable ? 0xff3048 : 0xffffff);
       updateGrabGlow(aimMesh);
     } else {
@@ -1099,10 +1381,16 @@ function animate() {
     }
 
     let desired = 'open';
-    if (!isPaused && performance.now() < handExtendedUntil) {
-      desired = 'extended';
-    } else if (grabbedBody !== null) {
-      desired = 'close';
+    if (!isPaused) {
+      if (grabbedBody !== null) {
+        desired = 'close';
+      } else if (shieldPressed) {
+        desired = 'extended';
+      } else if (performance.now() < handExtendedUntil) {
+        desired = 'extended';
+      } else {
+        desired = 'open';
+      }
     }
     if (desired !== lastHandVisual) {
       if (desired === 'open') handMat.map = texHandOpen;
@@ -1114,6 +1402,7 @@ function animate() {
 
     sceneHUD.visible = true;
   } else {
+    magnetShieldGroup.visible = false;
     sceneHUD.visible = false;
     crosshairMat.color.set(0xffffff);
     clearGrabGlow();
