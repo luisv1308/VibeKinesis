@@ -42,16 +42,52 @@
         line-height: 1.5;
         max-width: 420px;
       }
+      #damageFlash {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background: radial-gradient(
+          ellipse at center,
+          rgba(180, 20, 20, 0.55) 0%,
+          rgba(80, 0, 0, 0.2) 50%,
+          transparent 70%
+        );
+        opacity: 0;
+        z-index: 3;
+        transition: opacity 0.08s ease-out;
+      }
+      #pauseOverlay {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        background: rgba(6, 8, 14, 0.42);
+        color: #e8e8f0;
+        font-size: 1.1rem;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        z-index: 4;
+        opacity: 0;
+        transition: opacity 0.15s ease;
+      }
+      #pauseOverlay.visible {
+        opacity: 1;
+      }
     </style>
   </head>
   <body>
+    <div id="pauseOverlay" aria-hidden="true">PAUSA · P</div>
+    <div id="damageFlash" aria-hidden="true"></div>
     <div id="blocker">
       <div>
         <h1>Clic para jugar</h1>
         <p>
           WASD para mover, ratón para mirar.<br />
           Clic derecho mantenido: atrae el cubo señalado.<br />
-          Suelta el clic derecho para lanzarlo hacia donde miras.
+          Suelta el clic derecho para lanzarlo hacia donde miras.<br />
+          P: pausa (no aparecen enemigos ni avanza la física).
         </p>
       </div>
     </div>

@@ -11,9 +11,28 @@ const GRAB_REACH = 40;
 const PULL_GAIN = 10;
 const PULL_MAX_SPEED = 28;
 const LAUNCH_SPEED = 42;
+const LAUNCH_PROJECTILE_MULT = 1.5;
+
+const PROJ_RADIUS = 0.22;
+const PROJ_MASS = 0.16;
+/** Radio solo visual (balas más visibles para apuntar/agarrar). */
+const PROJ_VISUAL_SCALE = 2;
+/** Esfera invisible grande solo para el raycaster (más fácil “pescar”). */
+const PROJ_PICK_RADIUS = 0.58;
+const BULLET_TIME_NEAR_DIST = 5;
+const BULLET_TIME_SCALE = 0.2;
+/** Más lento = tiempo de reacción y telequinesis jugables. */
+const PROJ_ENEMY_SPEED = 19;
+const PROJ_MAX_LIFE = 14;
+const DRONE_ATTACK_MIN_DIST = 10;
+const DRONE_ATTACK_MAX_DIST = 20;
+const DRONE_FIRE_COOLDOWN = 3;
+const PLAYER_HIT_RADIUS = 0.55;
 
 const DRONE_RADIUS = 0.38;
 const DRONE_MASS = 0.55;
+/** Evita spawnear la bala dentro del cuerpo del dron (solapamiento = empuje aleatorio del solver). */
+const PROJ_SPAWN_CLEARANCE = DRONE_RADIUS + PROJ_RADIUS + 0.1;
 /** Velocidad máxima tipo “zombie” (unidades/s). */
 const DRONE_MAX_SPEED = 3.6;
 /** Qué tan rápido corrigen hacia esa velocidad (bajo = más lentos y estables). */
@@ -55,6 +74,14 @@ const camera = new THREE.PerspectiveCamera(
   200
 );
 camera.position.set(0, PLAYER_EYE_HEIGHT, 8);
+
+/** Referencia invisible que sigue a la cámara: puntería de drones y vector de disparo. */
+const playerTarget = new THREE.Object3D();
+playerTarget.name = 'playerTarget';
+scene.add(playerTarget);
+playerTarget.position.copy(camera.position);
+
+let physicsTimeScale = 1;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -227,6 +254,15 @@ updateHudLayout();
 const controls = new PointerLockControls(camera, document.body);
 
 const blocker = document.getElementById('blocker');
+const pauseOverlayEl = document.getElementById('pauseOverlay');
+let isPaused = false;
+const damageFlashEl = document.getElementById('damageFlash');
+let damageFlashTimer = 0;
+
+function triggerDamageFeedback() {
+  damageFlashTimer = 0.28;
+  if (damageFlashEl) damageFlashEl.style.opacity = '0.5';
+}
 
 document.addEventListener('click', () => {
   if (!controls.isLocked) {
@@ -241,7 +277,7 @@ controls.addEventListener('lock', () => {
 controls.addEventListener('unlock', () => {
   blocker.classList.remove('hidden');
   if (grabbedBody) {
-    const mesh = cubeMeshFromBody(grabbedBody);
+    const mesh = meshFromBody(grabbedBody);
     if (mesh) clearGrabTransparency(mesh);
     grabbedBody = null;
   }
@@ -279,9 +315,37 @@ groundBody.addShape(groundShape);
 groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
 world.addBody(groundBody);
 
+const playerBody = new CANNON.Body({ mass: 0 });
+playerBody.type = CANNON.Body.STATIC;
+playerBody.addShape(new CANNON.Sphere(PLAYER_HIT_RADIUS));
+playerBody.userData = { isPlayer: true };
+world.addBody(playerBody);
+
 const cubeMeshes = [];
+const projectileMeshes = [];
+const enemyProjectiles = [];
+
+/** Los proyectiles no deben caer como balística: la gravedad del mundo los hunde hacia el suelo antes de llegar al jugador. */
+world.addEventListener('preStep', () => {
+  const gy = world.gravity.y;
+  for (const ent of enemyProjectiles) {
+    if (ent.dead) continue;
+    ent.body.force.y += -gy * ent.body.mass;
+  }
+});
+
+const projGeo = new THREE.SphereGeometry(PROJ_RADIUS, 12, 12);
+const pickGeo = new THREE.SphereGeometry(PROJ_PICK_RADIUS, 16, 16);
 const raycaster = new THREE.Raycaster();
 const ndcCenter = new THREE.Vector2(0, 0);
+const _tmpBulletNear = new THREE.Vector3();
+
+class EnemyBullet {
+  constructor(ent) {
+    this.ent = ent;
+    ent.group.userData.enemyBulletClass = this;
+  }
+}
 
 const boxGeo = new THREE.BoxGeometry(1, 1, 1);
 const boxColors = [0x5b8cff, 0xff6b6b, 0x51cf66, 0xffd43b, 0xcc5de8, 0x22b8cf];
@@ -382,6 +446,7 @@ function createDrone(x, y, z) {
     dying: false,
     deathPhase: 0,
     personalOffset: randomPersonalOffset(),
+    shootTimer: 0,
   };
 
   body.addEventListener('collide', (e) => {
@@ -414,6 +479,35 @@ function updateDronesAI(dt) {
   for (const d of drones) {
     if (d.dying) continue;
     const b = d.body;
+    _droneToPlayer.set(
+      playerTarget.position.x - b.position.x,
+      playerTarget.position.y - b.position.y,
+      playerTarget.position.z - b.position.z
+    );
+    const distToCam = _droneToPlayer.length();
+    const inAttackBand =
+      distToCam >= DRONE_ATTACK_MIN_DIST && distToCam <= DRONE_ATTACK_MAX_DIST;
+
+    if (inAttackBand) {
+      d.mesh.position.set(b.position.x, b.position.y, b.position.z);
+      d.mesh.lookAt(playerTarget.position);
+      d.shootTimer += dt;
+      if (d.shootTimer >= DRONE_FIRE_COOLDOWN) {
+        d.shootTimer = 0;
+        createEnemyProjectile(
+          b.position.x,
+          b.position.y,
+          b.position.z,
+          playerTarget.position.x,
+          playerTarget.position.y,
+          playerTarget.position.z
+        );
+      }
+      continue;
+    }
+
+    d.shootTimer = 0;
+
     const ox = d.personalOffset.x;
     const oy = d.personalOffset.y;
     const oz = d.personalOffset.z;
@@ -465,8 +559,223 @@ function syncDroneMeshes() {
   for (const d of drones) {
     if (d.dying) continue;
     d.mesh.position.copy(d.body.position);
-    d.mesh.quaternion.copy(d.body.quaternion);
   }
+}
+
+function captureProjectileVisual(ent) {
+  ent.state = 'friendly';
+  const mat = ent.visualMesh.material;
+  mat.color.setHex(0x22eeff);
+  mat.emissive.setHex(0x00ccff);
+  mat.emissiveIntensity = 2.1;
+  mat.needsUpdate = true;
+}
+
+function onProjectileCollide(ent, other) {
+  if (!ent || ent.dead) return;
+  if (other === groundBody && ent.state === 'enemy') {
+    removeProjectile(ent);
+    return;
+  }
+  if (other === playerBody && ent.state === 'enemy') {
+    removeProjectile(ent);
+    triggerDamageFeedback();
+    return;
+  }
+  if (ent.state === 'friendly') {
+    const drone = drones.find((d) => !d.dying && d.body === other);
+    if (drone) {
+      killDrone(drone);
+      removeProjectile(ent);
+    }
+  }
+}
+
+function removeProjectile(ent) {
+  if (ent.dead) return;
+  ent.dead = true;
+  if (grabGlowMesh === ent.visualMesh) clearGrabGlow();
+  if (grabbedBody === ent.body) {
+    const mesh = meshFromBody(ent.body);
+    if (mesh) clearGrabTransparency(mesh);
+    grabbedBody = null;
+  }
+  const ei = enemyProjectiles.indexOf(ent);
+  if (ei >= 0) enemyProjectiles.splice(ei, 1);
+  const mi = projectileMeshes.indexOf(ent.group);
+  if (mi >= 0) projectileMeshes.splice(mi, 1);
+  world.removeBody(ent.body);
+  ent.visualMesh.material.dispose();
+  ent.pickMesh.material.dispose();
+  scene.remove(ent.group);
+}
+
+function createEnemyProjectile(ox, oy, oz, tx, ty, tz) {
+  const dx = tx - ox;
+  const dy = ty - oy;
+  const dz = tz - oz;
+  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  let nx;
+  let ny;
+  let nz;
+  if (dist < 1e-5) {
+    nx = 0;
+    ny = 0;
+    nz = -1;
+  } else {
+    const inv = 1 / dist;
+    nx = dx * inv;
+    ny = dy * inv;
+    nz = dz * inv;
+  }
+  /** Salir del volumen del dron antes del primer paso de física (vector = playerTarget − centro dron). */
+  const along =
+    dist > PROJ_SPAWN_CLEARANCE
+      ? PROJ_SPAWN_CLEARANCE
+      : Math.max(0, dist * 0.4);
+  const sx = ox + nx * along;
+  const sy = oy + ny * along;
+  const sz = oz + nz * along;
+
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xffcc44,
+    emissive: 0xff6600,
+    emissiveIntensity: 2.5,
+    metalness: 0.2,
+    roughness: 0.35,
+  });
+  const visualMesh = new THREE.Mesh(projGeo, mat);
+  visualMesh.scale.setScalar(PROJ_VISUAL_SCALE);
+  visualMesh.castShadow = true;
+
+  const pickMat = new THREE.MeshBasicMaterial({
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    color: 0x000000,
+  });
+  const pickMesh = new THREE.Mesh(pickGeo, pickMat);
+
+  const group = new THREE.Group();
+  group.add(visualMesh);
+  group.add(pickMesh);
+  scene.add(group);
+
+  const shape = new CANNON.Sphere(PROJ_RADIUS);
+  const body = new CANNON.Body({
+    mass: PROJ_MASS,
+    linearDamping: 0,
+    angularDamping: 0.35,
+    position: new CANNON.Vec3(sx, sy, sz),
+    collisionResponse: true,
+  });
+  body.addShape(shape);
+
+  body.velocity.set(
+    nx * PROJ_ENEMY_SPEED,
+    ny * PROJ_ENEMY_SPEED,
+    nz * PROJ_ENEMY_SPEED
+  );
+
+  const ent = {
+    group,
+    visualMesh,
+    pickMesh,
+    body,
+    state: 'enemy',
+    age: 0,
+    dead: false,
+  };
+  new EnemyBullet(ent);
+
+  body.userData = { projectileEnt: ent };
+
+  visualMesh.userData = {
+    body,
+    isGrabbable: true,
+    isProjectile: true,
+    projectileEnt: ent,
+  };
+  pickMesh.userData = {
+    body,
+    isGrabbable: true,
+    isProjectile: true,
+    projectileEnt: ent,
+    visualMesh,
+    isProjectilePick: true,
+  };
+  group.userData = {
+    body,
+    isProjectile: true,
+    projectileEnt: ent,
+    visualMesh,
+    pickMesh,
+  };
+
+  body.addEventListener('collide', (e) => {
+    onProjectileCollide(ent, e.body);
+  });
+
+  world.addBody(body);
+  projectileMeshes.push(group);
+  enemyProjectiles.push(ent);
+  return ent;
+}
+
+function updateProjectileLife(dt) {
+  for (let i = enemyProjectiles.length - 1; i >= 0; i--) {
+    const ent = enemyProjectiles[i];
+    if (ent.dead) continue;
+    ent.age += dt;
+    if (
+      ent.age > PROJ_MAX_LIFE &&
+      ent.state === 'enemy' &&
+      grabbedBody !== ent.body
+    ) {
+      removeProjectile(ent);
+    }
+  }
+}
+
+function syncProjectileMeshes() {
+  for (const ent of enemyProjectiles) {
+    if (ent.dead) continue;
+    ent.group.position.copy(ent.body.position);
+    ent.group.quaternion.copy(ent.body.quaternion);
+  }
+}
+
+function updateBulletTimeAndPhysicsScale() {
+  if (grabbedBody?.userData?.projectileEnt) {
+    physicsTimeScale = 1;
+    return;
+  }
+  let near = false;
+  for (const ent of enemyProjectiles) {
+    if (ent.dead || ent.state !== 'enemy') continue;
+    const p = ent.body.position;
+    _tmpBulletNear.set(p.x, p.y, p.z);
+    if (
+      camera.position.distanceToSquared(_tmpBulletNear) <
+      BULLET_TIME_NEAR_DIST * BULLET_TIME_NEAR_DIST
+    ) {
+      near = true;
+      break;
+    }
+  }
+  if (!near) {
+    raycaster.setFromCamera(ndcCenter, camera);
+    const hits = raycaster.intersectObjects(projectileMeshes, true);
+    for (const h of hits) {
+      if (h.distance >= BULLET_TIME_NEAR_DIST) continue;
+      const pe = h.object.userData?.projectileEnt;
+      if (pe && !pe.dead && pe.state === 'enemy') {
+        near = true;
+        break;
+      }
+    }
+  }
+  physicsTimeScale = near ? BULLET_TIME_SCALE : 1;
 }
 
 let spawnTimer = 0;
@@ -480,22 +789,36 @@ const GRAB_CUBE_OPACITY = 0.32;
 
 function getLookedAtGrabbableMesh() {
   raycaster.setFromCamera(ndcCenter, camera);
-  const hits = raycaster.intersectObjects(cubeMeshes, false);
-  if (hits.length === 0) return null;
-  const hit = hits[0];
-  if (hit.distance > GRAB_REACH) return null;
-  const mesh = hit.object;
-  if (!mesh.userData.isGrabbable || !mesh.userData.body) return null;
-  return mesh;
+  const hits = raycaster.intersectObjects(
+    [...cubeMeshes, ...projectileMeshes],
+    true
+  );
+  hits.sort((a, b) => a.distance - b.distance);
+  for (const hit of hits) {
+    if (hit.distance > GRAB_REACH) return null;
+    const o = hit.object;
+    if (o.userData?.visualMesh && o.userData?.isProjectilePick) {
+      return o.userData.visualMesh;
+    }
+    if (o.userData?.isGrabbable && o.userData?.body) {
+      return o;
+    }
+  }
+  return null;
 }
 
-function getLookedAtCube() {
+function getLookedAtGrabbableBody() {
   const mesh = getLookedAtGrabbableMesh();
   return mesh ? mesh.userData.body : null;
 }
 
-function cubeMeshFromBody(body) {
-  return cubeMeshes.find((m) => m.userData.body === body) ?? null;
+function meshFromBody(body) {
+  if (!body) return null;
+  const cube = cubeMeshes.find((m) => m.userData.body === body);
+  if (cube) return cube;
+  const projRoot = projectileMeshes.find((m) => m.userData.body === body);
+  if (projRoot?.userData?.visualMesh) return projRoot.userData.visualMesh;
+  return null;
 }
 
 function clearGrabGlow() {
@@ -510,7 +833,7 @@ function updateGrabGlow(aimMesh) {
   if (
     grabbedBody &&
     aimMesh &&
-    cubeMeshFromBody(grabbedBody) === aimMesh
+    meshFromBody(grabbedBody) === aimMesh
   ) {
     clearGrabGlow();
     return;
@@ -557,30 +880,43 @@ function clearGrabTransparency(mesh) {
 window.addEventListener('contextmenu', (e) => e.preventDefault());
 
 window.addEventListener('mousedown', (e) => {
-  if (e.button !== 2 || !controls.isLocked) return;
-  const body = getLookedAtCube();
+  if (isPaused || e.button !== 2 || !controls.isLocked) return;
+  const body = getLookedAtGrabbableBody();
   if (body) {
+    if (body.userData?.projectileEnt) {
+      physicsTimeScale = 1;
+    }
     clearGrabGlow();
-    const mesh = cubeMeshFromBody(body);
-    if (mesh) applyGrabTransparency(mesh);
+    const mesh = meshFromBody(body);
+    if (mesh) {
+      if (mesh.userData.isProjectile && mesh.userData.projectileEnt) {
+        const pe = mesh.userData.projectileEnt;
+        if (pe.state === 'enemy') captureProjectileVisual(pe);
+      }
+      applyGrabTransparency(mesh);
+    }
     grabbedBody = body;
     body.wakeUp();
   }
 });
 
 window.addEventListener('mouseup', (e) => {
-  if (e.button !== 2) return;
+  if (isPaused || e.button !== 2) return;
   if (grabbedBody) {
-    const mesh = cubeMeshFromBody(grabbedBody);
+    const mesh = meshFromBody(grabbedBody);
     if (mesh) clearGrabTransparency(mesh);
   }
   if (grabbedBody && controls.isLocked) {
     const dir = new THREE.Vector3();
     camera.getWorldDirection(dir);
+    const pe = grabbedBody.userData?.projectileEnt;
+    const launchSpeed = pe
+      ? LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT
+      : LAUNCH_SPEED;
     grabbedBody.velocity.set(
-      dir.x * LAUNCH_SPEED,
-      dir.y * LAUNCH_SPEED,
-      dir.z * LAUNCH_SPEED
+      dir.x * launchSpeed,
+      dir.y * launchSpeed,
+      dir.z * launchSpeed
     );
     grabbedBody.angularVelocity.set(
       (Math.random() - 0.5) * 4,
@@ -602,6 +938,20 @@ const keys = {
 };
 
 window.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyP' && !e.repeat) {
+    isPaused = !isPaused;
+    if (pauseOverlayEl) {
+      pauseOverlayEl.classList.toggle('visible', isPaused);
+      pauseOverlayEl.setAttribute('aria-hidden', isPaused ? 'false' : 'true');
+    }
+    if (isPaused) {
+      keys.KeyW = false;
+      keys.KeyA = false;
+      keys.KeyS = false;
+      keys.KeyD = false;
+    }
+    return;
+  }
   if (keys.hasOwnProperty(e.code)) keys[e.code] = true;
 });
 
@@ -626,11 +976,27 @@ function syncMeshesFromPhysics() {
   }
 }
 
+function syncPlayerHitBody() {
+  playerBody.position.set(
+    camera.position.x,
+    camera.position.y,
+    camera.position.z
+  );
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
 
-  if (controls.isLocked) {
+  if (!isPaused) {
+    damageFlashTimer = Math.max(0, damageFlashTimer - dt);
+    if (damageFlashEl) {
+      damageFlashEl.style.opacity =
+        damageFlashTimer > 0 ? String(0.5 * (damageFlashTimer / 0.28)) : '0';
+    }
+  }
+
+  if (controls.isLocked && !isPaused) {
     forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
     forward.y = 0;
     if (forward.lengthSq() > 1e-6) forward.normalize();
@@ -684,13 +1050,15 @@ function animate() {
     }
   }
 
-  const shakeDecay = Math.pow(0.82, dt * 60);
-  handShakeX *= shakeDecay;
-  handShakeY *= shakeDecay;
+  if (!isPaused) {
+    const shakeDecay = Math.pow(0.82, dt * 60);
+    handShakeX *= shakeDecay;
+    handShakeY *= shakeDecay;
+  }
 
   handSprite.position.set(handBaseX + handShakeX, handBaseY + handShakeY, 0);
 
-  if (controls.isLocked) {
+  if (controls.isLocked && !isPaused) {
     spawnTimer += dt;
     if (spawnTimer >= SPAWN_INTERVAL) {
       spawnTimer = 0;
@@ -700,25 +1068,38 @@ function animate() {
         createDrone(p.x, p.y, p.z);
       }
     }
-  } else {
+  } else if (!controls.isLocked) {
     spawnTimer = 0;
   }
 
-  updateDronesAI(dt);
+  if (!isPaused) {
+    playerTarget.position.copy(camera.position);
 
-  world.fixedStep(1 / 60, 8);
-  syncMeshesFromPhysics();
-  syncDroneMeshes();
-  updateDronesDeath(dt);
+    updateBulletTimeAndPhysicsScale();
+    updateDronesAI(dt);
+    updateProjectileLife(dt);
+    syncPlayerHitBody();
+
+    world.fixedStep((1 / 60) * physicsTimeScale, 8);
+    syncMeshesFromPhysics();
+    syncDroneMeshes();
+    syncProjectileMeshes();
+    updateDronesDeath(dt);
+  }
 
   if (controls.isLocked) {
-    const aimMesh = getLookedAtGrabbableMesh();
-    const grabbable = aimMesh !== null;
-    crosshairMat.color.set(grabbable ? 0xff3048 : 0xffffff);
-    updateGrabGlow(aimMesh);
+    if (!isPaused) {
+      const aimMesh = getLookedAtGrabbableMesh();
+      const grabbable = aimMesh !== null;
+      crosshairMat.color.set(grabbable ? 0xff3048 : 0xffffff);
+      updateGrabGlow(aimMesh);
+    } else {
+      crosshairMat.color.set(0xffffff);
+      clearGrabGlow();
+    }
 
     let desired = 'open';
-    if (performance.now() < handExtendedUntil) {
+    if (!isPaused && performance.now() < handExtendedUntil) {
       desired = 'extended';
     } else if (grabbedBody !== null) {
       desired = 'close';
