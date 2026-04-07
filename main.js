@@ -51,6 +51,13 @@ const DRONE_DEATH_SHRINK_SPEED = 7;
 const DRONE_FLASH_SEC = 0.12;
 const MAX_DRONES = 36;
 
+/** --- Prueba: `true` = no spawn de drones; `TEST_MODE_DUAL_MG` = dos ametralladoras fijas. */
+const TEST_MODE_NO_DRONES = true;
+const TEST_MODE_DUAL_MG = true;
+const TEST_MG_FIRE_INTERVAL = 3;
+const TEST_MG_A = Object.freeze({ x: -20, y: 1.6, z: -35 });
+const TEST_MG_B = Object.freeze({ x: 24, y: 1.8, z: 30 });
+
 const HAND_SIZE_PX = 292;
 /** Mano derecha (telequinesis): fracción del ancho a la derecha del centro. */
 const HAND_RIGHT_ANCHOR_X_FRAC = 0.1;
@@ -62,10 +69,18 @@ const HAND_EXTENDED_MS = 200;
 const HAND_KICK_X = 14;
 const HAND_KICK_Y = 18;
 
-/** Distancia recorrida máxima por proyectil enemigo (trayectoria recta); al superarla se elimina. */
-const PROJ_MAX_PATH_TRAVEL = 85;
+/** Distancia recorrida máxima por proyectil enemigo (trayectoria recta). */
+const PROJ_MAX_PATH_TRAVEL = 120;
+/** Telequinesis / lanzamiento aliado (sin plasma): debe alcanzar paredes lejanas del arena. */
+const PROJ_FRIENDLY_STRAIGHT_MAX_PATH = 520;
 /** Segundos máximos de vida (respaldo). */
 const PROJ_MAX_LIFE = 40;
+/** Modo burbuja (rebotes): sin tope de distancia; solo edad y escape del mapa. */
+const PROJ_BUBBLE_MAX_LIFE = 120;
+/** Disparos rectos: cuánta gravedad del mundo se “anula” (0 = caen normal; 1 = vuelo horizontal como antes). */
+const PROJ_GRAVITY_CANCEL_STRAIGHT = 0.52;
+/** Mezcla velocidad Y física tras integrar (cae un poco aunque apuntes recto). */
+const PROJ_GRAVITY_BLEND_Y = 0.38;
 /** Fusión bala+bala → rayo plasma (aliado, atraviesa drones). */
 const PROJ_PLASMA_SPEED = 64;
 const PROJ_PLASMA_MAX_PATH = 240;
@@ -92,13 +107,22 @@ const FUSION_PREVIEW_TINT = 0xffb8e0;
 const FUSION_LINE_COLOR = 0xff66c4;
 const FUSION_PREVIEW_INTENSITY_CUBE = 1.25;
 const FUSION_PREVIEW_INTENSITY_PROJ = 2.65;
-/** Rebote de balas aliadas contra el suelo (antes se borraban al instante). */
-const FRIENDLY_GROUND_RESTITUTION = 0.7;
-const FRIENDLY_GROUND_BOUNCE_MIN_SPEED = 2.6;
 /** Mismo límite horizontal que el jugador (cámara clamp ±ARENA_HALF). Fuera → se elimina el disparo enemigo. */
 const ARENA_HALF = 58;
 const ARENA_Y_MIN = -2;
 const ARENA_Y_MAX = 80;
+/** Límites físicos del arena (paredes; más gruesas = menos tunelado a alta velocidad). */
+const ARENA_WALL_HALF_THICK = 1.25;
+const ARENA_WALL_HEIGHT = 46;
+/** Pelotas tipo ping-pong: rápidas, más elásticas; siguen hasta pegar dron. */
+const BUBBLE_WALL_RESTITUTION = 0.82;
+const BUBBLE_GROUND_RESTITUTION = 0.76;
+const BUBBLE_SPEED_RETENTION = 0.78;
+const BUBBLE_MAX_SPEED = 40;
+const BUBBLE_MIN_SPEED = 20;
+/** Impulso aleatorio suave (rompe rebotes perfectos hacia la misma línea). */
+const BUBBLE_RANDOM_IMPULSE = 1.35;
+const FUSED_PROJ_BLAST_RADIUS = 3.5;
 
 /** Combinación magnética (escudo + vórtice). */
 const VORTEX_RADIUS = 3;
@@ -122,6 +146,8 @@ world.broadphase = new CANNON.SAPBroadphase(world);
 /** Proyectiles enemigos: grupo propio para no chocar entre sí. */
 const COLLISION_GROUP_ENEMY_PROJECTILE = 2;
 const COLLISION_MASK_ENEMY_PROJECTILE = -1 ^ COLLISION_GROUP_ENEMY_PROJECTILE;
+/** Hitbox del jugador: los proyectiles en telaraña dejan de colisionar con este grupo. */
+const COLLISION_GROUP_PLAYER_BODY = 256;
 /**
  * Pareja en fusión magnética: filtros cruzados para que no colisionen entre sí
  * (el proyectil es muy ligero y el solver lo expulsaba del cubo cada frame).
@@ -488,9 +514,45 @@ groundBody.addShape(groundShape);
 groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
 world.addBody(groundBody);
 
+{
+  const H = ARENA_WALL_HEIGHT;
+  const AH = ARENA_HALF;
+  const T = ARENA_WALL_HALF_THICK;
+  const yc = H * 0.5;
+  const wallMat = new THREE.MeshStandardMaterial({
+    color: 0x2a3144,
+    roughness: 0.9,
+    metalness: 0.1,
+    emissive: 0x080c18,
+    emissiveIntensity: 0.22,
+  });
+  const addWall = (cx, cy, cz, hx, hy, hz) => {
+    const shape = new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
+    const body = new CANNON.Body({ mass: 0 });
+    body.addShape(shape);
+    body.position.set(cx, cy, cz);
+    body.userData = { isArenaWall: true };
+    world.addBody(body);
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2),
+      wallMat
+    );
+    mesh.position.set(cx, cy, cz);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+  };
+  addWall(AH + T, yc, 0, T, H * 0.5, AH + T);
+  addWall(-AH - T, yc, 0, T, H * 0.5, AH + T);
+  addWall(0, yc, AH + T, AH + T, H * 0.5, T);
+  addWall(0, yc, -AH - T, AH + T, H * 0.5, T);
+}
+
 const playerBody = new CANNON.Body({ mass: 0 });
 playerBody.type = CANNON.Body.STATIC;
 playerBody.addShape(new CANNON.Sphere(PLAYER_HIT_RADIUS));
+playerBody.collisionFilterGroup = COLLISION_GROUP_PLAYER_BODY;
+playerBody.collisionFilterMask = -1;
 playerBody.userData = { isPlayer: true };
 world.addBody(playerBody);
 
@@ -558,6 +620,20 @@ function getFusionPairIndices(n, pairIdx) {
 
 function isBodyMagneticallyCaptured(body) {
   return capturedObjects.some((c) => c.body === body);
+}
+
+function applyVortexProjectileIgnorePlayer(entry) {
+  if (entry.kind !== 'projectile' || !entry.projectileEnt) return;
+  const pb = entry.projectileEnt.body;
+  entry._vortexPlayerMaskSave = pb.collisionFilterMask;
+  pb.collisionFilterMask = pb.collisionFilterMask & ~COLLISION_GROUP_PLAYER_BODY;
+}
+
+function restoreVortexProjectilePlayerCollision(entry) {
+  if (entry?.kind !== 'projectile' || !entry.projectileEnt) return;
+  if (entry._vortexPlayerMaskSave == null) return;
+  entry.projectileEnt.body.collisionFilterMask = entry._vortexPlayerMaskSave;
+  delete entry._vortexPlayerMaskSave;
 }
 
 function isBodyInMagneticFusion(body) {
@@ -1149,6 +1225,7 @@ function updateMagneticVortex(dt) {
       if (entry.kind === 'cube') {
         applyGrabTransparency(entry.mesh);
       } else if (entry.projectileEnt?.visualMesh) {
+        applyVortexProjectileIgnorePlayer(entry);
         applyGrabTransparency(
           entry.projectileEnt.visualMesh,
           GRAB_PROJECTILE_VORTEX_OPACITY
@@ -1401,54 +1478,151 @@ function syncDroneMeshes() {
   }
 }
 
-/**
- * Rebota balas telequinéticas (y plasma) en el plano; actualiza dirección para vuelo recto.
- * @returns {'dead'|'graze'|'bounced'}
- */
-function bounceFriendlyProjectileOnGround(ent, contact) {
-  const b = ent.body;
-  let nx = 0;
-  let ny = 1;
-  let nz = 0;
-  if (contact?.ni) {
-    nx = -contact.ni.x;
-    ny = -contact.ni.y;
-    nz = -contact.ni.z;
-    const nlen = Math.hypot(nx, ny, nz);
-    if (nlen > 1e-6) {
-      nx /= nlen;
-      ny /= nlen;
-      nz /= nlen;
-    } else {
-      nx = 0;
-      ny = 1;
-      nz = 0;
-    }
+function isArenaWallBody(body) {
+  return Boolean(body?.userData?.isArenaWall);
+}
+
+function fuseProjectileExplode(ent) {
+  if (!ent || ent.dead) return;
+  const p = ent.body.position;
+  const px = p.x;
+  const py = p.y;
+  const pz = p.z;
+  const r2 = FUSED_PROJ_BLAST_RADIUS * FUSED_PROJ_BLAST_RADIUS;
+  for (const d of drones) {
+    if (d.dying) continue;
+    const q = d.body.position;
+    const dx = q.x - px;
+    const dy = q.y - py;
+    const dz = q.z - pz;
+    if (dx * dx + dy * dy + dz * dz <= r2) killDrone(d);
   }
+  removeProjectile(ent);
+}
+
+/**
+ * Rebote tipo burbuja: pierde energía, velocidad acotada, dirección con variación aleatoria.
+ * @returns {'graze'|'bounced'}
+ */
+function applyExplosiveBubbleBarrierBounce(ent, nx, ny, nz, restitution) {
+  const b = ent.body;
+  const nlen = Math.hypot(nx, ny, nz);
+  if (nlen < 1e-6) return 'graze';
+  const nnx = nx / nlen;
+  const nny = ny / nlen;
+  const nnz = nz / nlen;
   const vx = b.velocity.x;
   const vy = b.velocity.y;
   const vz = b.velocity.z;
-  const vn = vx * nx + vy * ny + vz * nz;
-  if (vn >= -0.06) return 'graze';
-  const e = FRIENDLY_GROUND_RESTITUTION;
-  const outX = vx - (1 + e) * vn * nx;
-  const outY = vy - (1 + e) * vn * ny;
-  const outZ = vz - (1 + e) * vn * nz;
-  const sp = Math.hypot(outX, outY, outZ);
-  if (sp < FRIENDLY_GROUND_BOUNCE_MIN_SPEED) {
-    removeProjectile(ent);
-    return 'dead';
+  const vn = vx * nnx + vy * nny + vz * nnz;
+  /** Solo ignorar si ya se separa de la superficie (antes “graze” fallaba y el rayo seguía clavado en la pared). */
+  if (vn > 0.06) return 'graze';
+  const e = restitution;
+  let ox = vx - (1 + e) * vn * nnx;
+  let oy = vy - (1 + e) * vn * nny;
+  let oz = vz - (1 + e) * vn * nnz;
+  ox += (Math.random() - 0.5) * BUBBLE_RANDOM_IMPULSE;
+  oy += (Math.random() - 0.5) * BUBBLE_RANDOM_IMPULSE;
+  oz += (Math.random() - 0.5) * BUBBLE_RANDOM_IMPULSE;
+  const rawLen = Math.hypot(ox, oy, oz);
+  if (rawLen < 1e-5) {
+    ox = nnx;
+    oy = Math.abs(nny) > 0.9 ? 0 : 1;
+    oz = nnz;
   }
-  b.velocity.set(outX, outY, outZ);
-  const inv = 1 / sp;
-  ent.friendlyFlightDir = { x: outX * inv, y: outY * inv, z: outZ * inv };
-  ent.friendlyFlightSpeed = sp;
+  const il = Math.hypot(ox, oy, oz);
+  const invl = il > 1e-6 ? 1 / il : 1;
+  let dx = ox * invl;
+  let dy = oy * invl;
+  let dz = oz * invl;
+  let sp = rawLen * BUBBLE_SPEED_RETENTION;
+  sp = THREE.MathUtils.clamp(sp, BUBBLE_MIN_SPEED, BUBBLE_MAX_SPEED);
+  delete ent.enemyDir;
+  delete ent.plasmaDir;
+  delete ent.friendlyFlightDir;
+  delete ent.friendlyFlightSpeed;
+  ent.bubbleMode = true;
+  ent.bubbleDir = { x: dx, y: dy, z: dz };
+  ent.bubbleSpeed = sp;
+  ent.pathTraveled = 0;
+  b.velocity.set(dx * sp, dy * sp, dz * sp);
+  b.angularVelocity.set(0, 0, 0);
   return 'bounced';
+}
+
+function tryBubbleBounceFromContact(ent, contact, restitution) {
+  if (!contact?.ni) return 'graze';
+  const nx = -contact.ni.x;
+  const ny = -contact.ni.y;
+  const nz = -contact.ni.z;
+  return applyExplosiveBubbleBarrierBounce(ent, nx, ny, nz, restitution);
+}
+
+function getProjectileSphereRadius(ent) {
+  const sh = ent.body.shapes?.[0];
+  if (sh && typeof sh.radius === 'number') return sh.radius;
+  return PROJ_RADIUS;
+}
+
+/**
+ * Si el solver “salta” la pared a alta velocidad, empuja el centro al límite interior y aplica rebote.
+ * Va antes de enforceEnemyProjectileStraightFlight (postStep).
+ */
+function resolveProjectileArenaTunneling() {
+  for (const ent of enemyProjectiles) {
+    if (ent.dead) continue;
+    if (grabbedBody === ent.body) continue;
+    if (ent.shieldStuck || ent.shieldDropping) continue;
+    if (isBodyMagneticallyCaptured(ent.body)) continue;
+    if (isBodyInMagneticFusion(ent.body)) continue;
+
+    const r = getProjectileSphereRadius(ent);
+    const pad = 0.06;
+    const lim = ARENA_HALF - r - pad;
+    const p = ent.body.position;
+    let nx = 0;
+    let nz = 0;
+    let moved = false;
+
+    if (p.x > lim) {
+      p.x = lim;
+      nx -= 1;
+      moved = true;
+    } else if (p.x < -lim) {
+      p.x = -lim;
+      nx += 1;
+      moved = true;
+    }
+    if (p.z > lim) {
+      p.z = lim;
+      nz -= 1;
+      moved = true;
+    } else if (p.z < -lim) {
+      p.z = -lim;
+      nz += 1;
+      moved = true;
+    }
+
+    if (!moved) continue;
+
+    const nh = Math.hypot(nx, nz);
+    if (nh < 1e-6) continue;
+    applyExplosiveBubbleBarrierBounce(
+      ent,
+      nx / nh,
+      0,
+      nz / nh,
+      BUBBLE_WALL_RESTITUTION
+    );
+  }
 }
 
 function captureProjectileVisual(ent) {
   ent.state = 'friendly';
   ent.pathTraveled = 0;
+  delete ent.bubbleMode;
+  delete ent.bubbleDir;
+  delete ent.bubbleSpeed;
   delete ent.enemyDir;
   delete ent.friendlyFlightDir;
   delete ent.friendlyFlightSpeed;
@@ -1461,13 +1635,32 @@ function captureProjectileVisual(ent) {
 
 function onProjectileCollide(ent, other, contact) {
   if (!ent || ent.dead) return;
+
+  const drone = drones.find((d) => !d.dying && d.body === other);
+  if (drone && ent.state === 'enemy' && !ent.shieldStuck) {
+    killDrone(drone);
+    fuseProjectileExplode(ent);
+    return;
+  }
+  if (drone && ent.state === 'friendly' && !ent.shieldStuck) {
+    killDrone(drone);
+    fuseProjectileExplode(ent);
+    return;
+  }
+
   if (other === groundBody && ent.state === 'enemy') {
     if (ent.shieldStuck) return;
-    removeProjectile(ent);
+    tryBubbleBounceFromContact(ent, contact, BUBBLE_GROUND_RESTITUTION);
+    return;
+  }
+  if (ent.state === 'enemy' && isArenaWallBody(other)) {
+    if (ent.shieldStuck) return;
+    tryBubbleBounceFromContact(ent, contact, BUBBLE_WALL_RESTITUTION);
     return;
   }
   if (other === playerBody && ent.state === 'enemy') {
     if (ent.shieldStuck) return;
+    if (isBodyMagneticallyCaptured(ent.body)) return;
     removeProjectile(ent);
     triggerDamageFeedback();
     return;
@@ -1475,22 +1668,11 @@ function onProjectileCollide(ent, other, contact) {
   if (ent.state === 'friendly') {
     if (other === playerBody) return;
     if (other === groundBody) {
-      const br = bounceFriendlyProjectileOnGround(ent, contact);
-      if (br === 'bounced' && ent.plasmaDir) {
-        delete ent.plasmaDir;
-        ent.pathTraveled = 0;
-      }
+      tryBubbleBounceFromContact(ent, contact, BUBBLE_GROUND_RESTITUTION);
       return;
     }
-    const drone = drones.find((d) => !d.dying && d.body === other);
-    if (drone) {
-      killDrone(drone);
-      if (ent.plasmaPierceLeft != null) {
-        ent.plasmaPierceLeft--;
-        if (ent.plasmaPierceLeft <= 0) removeProjectile(ent);
-      } else {
-        removeProjectile(ent);
-      }
+    if (isArenaWallBody(other)) {
+      tryBubbleBounceFromContact(ent, contact, BUBBLE_WALL_RESTITUTION);
       return;
     }
   }
@@ -1716,7 +1898,7 @@ function growPlasmaProjectile(ent) {
   mat.needsUpdate = true;
 }
 
-/** Fusión bala+bala: aliado, recto, atraviesa hasta N drones. */
+/** Fusión bala+bala: vuelo rápido hasta el 1.er rebote; luego burbuja como el resto. */
 function createPlasmaBolt(x, y, z, dx, dy, dz, holdInHand = false) {
   let dist = Math.hypot(dx, dy, dz);
   let nx;
@@ -1851,18 +2033,26 @@ function updateProjectileLife(dt) {
       continue;
     }
     const p = ent.body.position;
+    const escapeR =
+      ARENA_HALF +
+      2 * ARENA_WALL_HALF_THICK +
+      PROJ_RADIUS +
+      2.5;
     if (
-      (ent.state === 'enemy' || ent.plasmaDir || ent.friendlyFlightDir) &&
+      (ent.state === 'enemy' ||
+        ent.plasmaDir ||
+        ent.friendlyFlightDir ||
+        ent.bubbleMode) &&
       grabbedBody !== ent.body &&
-      (Math.abs(p.x) > ARENA_HALF ||
-        Math.abs(p.z) > ARENA_HALF ||
+      (Math.abs(p.x) > escapeR ||
+        Math.abs(p.z) > escapeR ||
         p.y < ARENA_Y_MIN ||
         p.y > ARENA_Y_MAX)
     ) {
       removeProjectile(ent);
       continue;
     }
-    if (grabbedBody !== ent.body) {
+    if (grabbedBody !== ent.body && !ent.bubbleMode) {
       let spd;
       if (ent.plasmaDir) spd = PROJ_PLASMA_SPEED;
       else if (ent.state === 'enemy' && ent.enemyDir) spd = PROJ_ENEMY_SPEED;
@@ -1872,30 +2062,35 @@ function updateProjectileLife(dt) {
           LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT;
       else spd = ent.body.velocity.length();
       ent.pathTraveled += spd * dt;
-      const maxPath = ent.plasmaDir ? PROJ_PLASMA_MAX_PATH : PROJ_MAX_PATH_TRAVEL;
+      let maxPath = PROJ_MAX_PATH_TRAVEL;
+      if (ent.plasmaDir) maxPath = PROJ_PLASMA_MAX_PATH;
+      else if (ent.friendlyFlightDir) maxPath = PROJ_FRIENDLY_STRAIGHT_MAX_PATH;
       if (ent.pathTraveled > maxPath) {
         removeProjectile(ent);
         continue;
       }
     }
-    if (ent.age > PROJ_MAX_LIFE && grabbedBody !== ent.body) {
+    const lifeCap = ent.bubbleMode ? PROJ_BUBBLE_MAX_LIFE : PROJ_MAX_LIFE;
+    if (ent.age > lifeCap && grabbedBody !== ent.body) {
       removeProjectile(ent);
     }
   }
 }
 
-/** Antes de integrar: quita gravedad en disparos rectos (enemigo o plasma). */
+/** Antes de integrar: en rectos solo se cancela parte de la gravedad; burbujas caen con el mundo. */
 function cancelEnemyProjectileGravity() {
   const g = world.gravity;
   const gx = g.x;
   const gy = g.y;
   const gz = g.z;
+  const k = PROJ_GRAVITY_CANCEL_STRAIGHT;
   for (const ent of enemyProjectiles) {
     if (ent.dead) continue;
     if (isBodyMagneticallyCaptured(ent.body)) continue;
     if (isBodyInMagneticFusion(ent.body)) continue;
     if (ent.shieldStuck || ent.shieldDropping) continue;
     if (grabbedBody === ent.body) continue;
+    if (ent.bubbleMode) continue;
     const enemyRay = ent.state === 'enemy' && ent.enemyDir;
     const plasmaRay = Boolean(ent.plasmaDir);
     const friendlyRay =
@@ -1903,39 +2098,39 @@ function cancelEnemyProjectileGravity() {
     if (!enemyRay && !plasmaRay && !friendlyRay) continue;
     const b = ent.body;
     const m = b.mass;
-    b.force.x -= m * gx;
-    b.force.y -= m * gy;
-    b.force.z -= m * gz;
+    b.force.x -= m * gx * k;
+    b.force.y -= m * gy * k;
+    b.force.z -= m * gz * k;
   }
 }
 
-/** Después del paso: velocidad constante en línea recta (enemigo o plasma). */
+/** Después del paso: rectos mantienen velocidad en la mira pero mezclan un poco de caída; burbujas = física libre. */
 function enforceEnemyProjectileStraightFlight() {
+  const blend = PROJ_GRAVITY_BLEND_Y;
   for (const ent of enemyProjectiles) {
     if (ent.dead) continue;
     if (isBodyMagneticallyCaptured(ent.body)) continue;
     if (isBodyInMagneticFusion(ent.body)) continue;
     if (ent.shieldStuck || ent.shieldDropping) continue;
     if (grabbedBody === ent.body) continue;
+    if (ent.bubbleMode) continue;
     if (ent.state === 'enemy' && ent.enemyDir) {
       const d = ent.enemyDir;
       const b = ent.body;
-      b.velocity.set(
-        d.x * PROJ_ENEMY_SPEED,
-        d.y * PROJ_ENEMY_SPEED,
-        d.z * PROJ_ENEMY_SPEED
-      );
+      const sp = PROJ_ENEMY_SPEED;
+      const vyPhys = b.velocity.y;
+      b.velocity.set(d.x * sp, d.y * sp, d.z * sp);
+      b.velocity.y = THREE.MathUtils.lerp(d.y * sp, vyPhys, blend);
       b.angularVelocity.set(0, 0, 0);
       continue;
     }
     if (ent.plasmaDir) {
       const d = ent.plasmaDir;
       const b = ent.body;
-      b.velocity.set(
-        d.x * PROJ_PLASMA_SPEED,
-        d.y * PROJ_PLASMA_SPEED,
-        d.z * PROJ_PLASMA_SPEED
-      );
+      const sp = PROJ_PLASMA_SPEED;
+      const vyPhys = b.velocity.y;
+      b.velocity.set(d.x * sp, d.y * sp, d.z * sp);
+      b.velocity.y = THREE.MathUtils.lerp(d.y * sp, vyPhys, blend);
       b.angularVelocity.set(0, 0, 0);
       continue;
     }
@@ -1945,7 +2140,9 @@ function enforceEnemyProjectileStraightFlight() {
         ent.friendlyFlightSpeed ??
         LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT;
       const b = ent.body;
+      const vyPhys = b.velocity.y;
       b.velocity.set(d.x * sp, d.y * sp, d.z * sp);
+      b.velocity.y = THREE.MathUtils.lerp(d.y * sp, vyPhys, blend);
       b.angularVelocity.set(0, 0, 0);
     }
   }
@@ -1973,6 +2170,7 @@ function cancelMagneticCaptureGravity() {
 
 world.addEventListener('preStep', cancelEnemyProjectileGravity);
 world.addEventListener('preStep', cancelMagneticCaptureGravity);
+world.addEventListener('postStep', resolveProjectileArenaTunneling);
 world.addEventListener('postStep', enforceEnemyProjectileStraightFlight);
 
 function computeShieldFrame() {
@@ -2118,6 +2316,8 @@ function updateBulletTimeAndPhysicsScale() {
 }
 
 let spawnTimer = 0;
+let testMgTimerA = 0;
+let testMgTimerB = 0;
 
 let grabbedBody = null;
 let grabGlowMesh = null;
@@ -2233,6 +2433,7 @@ function clearGrabTransparency(mesh) {
 
 function clearVortexTransparencyIfNotGrabbed(entry) {
   if (!entry || grabbedBody === entry.body) return;
+  restoreVortexProjectilePlayerCollision(entry);
   if (entry.kind === 'cube' && entry.mesh) {
     clearGrabTransparency(entry.mesh);
   } else if (entry.projectileEnt?.visualMesh) {
@@ -2276,6 +2477,9 @@ window.addEventListener('mousedown', (e) => {
       physicsTimeScale = 1;
       delete peGrab.friendlyFlightDir;
       delete peGrab.friendlyFlightSpeed;
+      delete peGrab.bubbleMode;
+      delete peGrab.bubbleDir;
+      delete peGrab.bubbleSpeed;
     }
     clearGrabGlow();
     const mesh = meshFromBody(body);
@@ -2307,6 +2511,10 @@ window.addEventListener('mouseup', (e) => {
     const pe = grabbedBody.userData?.projectileEnt;
     if (pe) {
       pe.pathTraveled = 0;
+      pe.age = 0;
+      delete pe.bubbleMode;
+      delete pe.bubbleDir;
+      delete pe.bubbleSpeed;
       pe.vortexImmuneUntil = performance.now() + VORTEX_LAUNCH_IMMUNE_MS;
       if (pe.plasmaDir) {
         pe.plasmaDir = { x: dir.x, y: dir.y, z: dir.z };
@@ -2495,17 +2703,50 @@ function animate() {
   leftHandSprite.position.set(handLeftBaseX, handBaseY, 0);
 
   if (controls.isLocked && !isPaused) {
-    spawnTimer += dt;
-    if (spawnTimer >= SPAWN_INTERVAL) {
-      spawnTimer = 0;
-      const alive = drones.filter((d) => !d.dying).length;
-      if (alive < MAX_DRONES) {
-        const p = randomSpawnPointAroundPlayer();
-        createDrone(p.x, p.y, p.z);
+    if (!TEST_MODE_NO_DRONES) {
+      spawnTimer += dt;
+      if (spawnTimer >= SPAWN_INTERVAL) {
+        spawnTimer = 0;
+        const alive = drones.filter((d) => !d.dying).length;
+        if (alive < MAX_DRONES) {
+          const p = randomSpawnPointAroundPlayer();
+          createDrone(p.x, p.y, p.z);
+        }
+      }
+    }
+    if (TEST_MODE_DUAL_MG) {
+      const tx = camera.position.x;
+      const ty = camera.position.y;
+      const tz = camera.position.z;
+      testMgTimerA += dt;
+      testMgTimerB += dt;
+      if (testMgTimerA >= TEST_MG_FIRE_INTERVAL) {
+        testMgTimerA = 0;
+        createEnemyProjectile(
+          TEST_MG_A.x,
+          TEST_MG_A.y,
+          TEST_MG_A.z,
+          tx,
+          ty,
+          tz
+        );
+      }
+      if (testMgTimerB >= TEST_MG_FIRE_INTERVAL) {
+        testMgTimerB = 0;
+        createEnemyProjectile(
+          TEST_MG_B.x,
+          TEST_MG_B.y,
+          TEST_MG_B.z,
+          tx,
+          ty,
+          tz
+        );
       }
     }
   } else if (!controls.isLocked) {
     spawnTimer = 0;
+    testMgTimerA = 0;
+    testMgTimerB = 0;
   }
 
   if (!isPaused) {
@@ -2517,7 +2758,7 @@ function animate() {
     syncPlayerHitBody();
 
     updateMagneticFusion(dt);
-    world.fixedStep((1 / 60) * physicsTimeScale, 8);
+    world.fixedStep((1 / 60) * physicsTimeScale, 20);
     syncMeshesFromPhysics();
     syncDroneMeshes();
     syncProjectileMeshes();
