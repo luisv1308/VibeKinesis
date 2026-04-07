@@ -35,7 +35,7 @@ const DRONE_PATTERN_CHASER = 'chaser';
 /** Rodean en órbita y disparan desde la banda. */
 const DRONE_PATTERN_STRAFE = 'strafe';
 /** Velocidad angular en órbita (rad/s). */
-const DRONE_ORBIT_ANGULAR_SPEED = 0.58;
+const DRONE_ORBIT_ANGULAR_SPEED = 1.02;
 /** Radio de órbita en XZ (dentro de la banda de disparo). */
 const DRONE_STRAFE_RADIUS_MIN = 11;
 const DRONE_STRAFE_RADIUS_MAX = 22;
@@ -46,12 +46,14 @@ const DRONE_RADIUS = 0.38;
 const DRONE_MASS = 0.55;
 /** Evita spawnear la bala dentro del cuerpo del dron (solapamiento = empuje aleatorio del solver). */
 const PROJ_SPAWN_CLEARANCE = DRONE_RADIUS + PROJ_RADIUS + 0.1;
-/** Velocidad máxima tipo “zombie” (unidades/s). */
-const DRONE_MAX_SPEED = 3.6;
-/** Qué tan rápido corrigen hacia esa velocidad (bajo = más lentos y estables). */
-const DRONE_STEER_STRENGTH = 3.2;
+/** Velocidad máxima de desplazamiento (unidades/s). */
+const DRONE_MAX_SPEED = 8.6;
+/** Qué tan rápido alcanzan esa velocidad (steering). */
+const DRONE_STEER_STRENGTH = 6.2;
 /** Tope de fuerza por frame para evitar tirones. */
-const DRONE_MAX_FORCE = 9;
+const DRONE_MAX_FORCE = 20;
+/** Amortiguación lineal del cuerpo (menos = más ágiles). */
+const DRONE_LINEAR_DAMPING = 0.28;
 const SPAWN_INTERVAL = 5;
 /** Anillo de aparición alrededor del jugador: radio interior / exterior. */
 const SPAWN_RING_INNER = 22;
@@ -1533,7 +1535,7 @@ function createDrone(x, y, z, opts = {}) {
   const shape = new CANNON.Sphere(radius);
   const body = new CANNON.Body({
     mass: elite ? ELITE_DRONE_MASS : DRONE_MASS,
-    linearDamping: 0.58,
+    linearDamping: elite ? DRONE_LINEAR_DAMPING * 0.88 : DRONE_LINEAR_DAMPING,
     angularDamping: 0.82,
     position: new CANNON.Vec3(x, y, z),
   });
@@ -1687,7 +1689,8 @@ function updateDronesAI(dt) {
     const vx = b.velocity.x;
     const vy = b.velocity.y;
     const vz = b.velocity.z;
-    const k = b.mass * DRONE_STEER_STRENGTH * dt;
+    const k =
+      b.mass * DRONE_STEER_STRENGTH * dt * (d.elite ? 1.2 : 1);
     _droneForce.set(
       (_droneToPlayer.x * DRONE_MAX_SPEED - vx) * k,
       (_droneToPlayer.y * DRONE_MAX_SPEED - vy) * k,
