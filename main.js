@@ -28,7 +28,8 @@ const PROJ_ENEMY_SPEED = 19;
 const DRONE_ATTACK_MIN_DIST = 10;
 const DRONE_ATTACK_MAX_DIST = 20;
 const DRONE_FIRE_COOLDOWN = 3;
-const PLAYER_HIT_RADIUS = 0.55;
+/** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
+const PLAYER_HIT_RADIUS = 0.64;
 
 const DRONE_RADIUS = 0.38;
 const DRONE_MASS = 0.55;
@@ -122,7 +123,14 @@ const BUBBLE_MAX_SPEED = 40;
 const BUBBLE_MIN_SPEED = 20;
 /** Impulso aleatorio suave (rompe rebotes perfectos hacia la misma línea). */
 const BUBBLE_RANDOM_IMPULSE = 1.35;
-const FUSED_PROJ_BLAST_RADIUS = 3.5;
+/** Explosión proyectil fusionado: trigger invisible 0→radio en 0,2 s; partículas 1 s. */
+const FUSION_EXPLOSION_TRIGGER_DURATION = 0.2;
+const FUSION_EXPLOSION_TRIGGER_MAX_RADIUS = 5;
+const FUSION_EXPLOSION_PARTICLE_COUNT = 80;
+const FUSION_EXPLOSION_PARTICLE_LIFE = 1;
+const FUSION_EXPLOSION_LIGHT_DURATION = 0.45;
+const FUSION_EXPLOSION_SHAKE_BASE = 0.2;
+const FUSION_IMPACT_MIN_SPEED_CUBE = 10;
 
 /** Combinación magnética (escudo + vórtice). */
 const VORTEX_RADIUS = 3;
@@ -405,8 +413,8 @@ const damageFlashEl = document.getElementById('damageFlash');
 let damageFlashTimer = 0;
 
 function triggerDamageFeedback() {
-  damageFlashTimer = 0.28;
-  if (damageFlashEl) damageFlashEl.style.opacity = '0.5';
+  damageFlashTimer = 0.35;
+  if (damageFlashEl) damageFlashEl.style.opacity = '0.62';
 }
 
 document.addEventListener('click', () => {
@@ -631,9 +639,36 @@ function applyVortexProjectileIgnorePlayer(entry) {
 
 function restoreVortexProjectilePlayerCollision(entry) {
   if (entry?.kind !== 'projectile' || !entry.projectileEnt) return;
-  if (entry._vortexPlayerMaskSave == null) return;
-  entry.projectileEnt.body.collisionFilterMask = entry._vortexPlayerMaskSave;
-  delete entry._vortexPlayerMaskSave;
+  const pb = entry.projectileEnt.body;
+  if (entry._vortexPlayerMaskSave != null) {
+    pb.collisionFilterMask = entry._vortexPlayerMaskSave;
+    delete entry._vortexPlayerMaskSave;
+  } else {
+    /** Respaldo: si no hubo guardado, forzar colisión por defecto con el jugador. */
+    pb.collisionFilterGroup = COLLISION_GROUP_ENEMY_PROJECTILE;
+    pb.collisionFilterMask = COLLISION_MASK_ENEMY_PROJECTILE;
+  }
+}
+
+/** Al soltar escudo/vórtice: quitar vuelo recto/burbuja para que solo caigan con gravedad. */
+function applyMagnetReleasedProjectileFall(ent, vx, vy, vz) {
+  if (!ent?.body) return;
+  delete ent.enemyDir;
+  delete ent.plasmaDir;
+  delete ent.friendlyFlightDir;
+  delete ent.friendlyFlightSpeed;
+  delete ent.bubbleMode;
+  delete ent.bubbleDir;
+  delete ent.bubbleSpeed;
+  const b = ent.body;
+  b.wakeUp();
+  b.angularVelocity.set(0, 0, 0);
+  b.velocity.set(vx, vy, vz);
+  /** Asegura golpe al jugador tras salir del vórtice (la máscara sin bit del jugador dejaba pasar la bala). */
+  if (ent.state === 'enemy') {
+    b.collisionFilterGroup = COLLISION_GROUP_ENEMY_PROJECTILE;
+    b.collisionFilterMask = COLLISION_MASK_ENEMY_PROJECTILE;
+  }
 }
 
 function isBodyInMagneticFusion(body) {
@@ -751,6 +786,17 @@ function removeMagneticCaptureForBody(body) {
 function releaseAllMagneticCapture() {
   for (const c of capturedObjects) {
     clearVortexTransparencyIfNotGrabbed(c);
+    if (c.kind === 'cube' && c.body) {
+      const b = c.body;
+      b.wakeUp();
+      b.velocity.set(0, 0, 0);
+      b.angularVelocity.set(0, 0, 0);
+      /** Caían “flotando” porque el vórtice movía posición cada frame y el cuerpo seguía dormido/sin caída hasta después del fixedStep. */
+      b.velocity.y = -1.8;
+    } else if (c.kind === 'projectile' && c.projectileEnt) {
+      /** Sin esto siguen con enemyDir / burbuja y enforce las acelera en línea recta. */
+      applyMagnetReleasedProjectileFall(c.projectileEnt, 0, -2.2, 0);
+    }
   }
   capturedObjects.length = 0;
   fusionPairCursor = 0;
@@ -1482,21 +1528,162 @@ function isArenaWallBody(body) {
   return Boolean(body?.userData?.isArenaWall);
 }
 
-function fuseProjectileExplode(ent) {
-  if (!ent || ent.dead) return;
-  const p = ent.body.position;
-  const px = p.x;
-  const py = p.y;
-  const pz = p.z;
-  const r2 = FUSED_PROJ_BLAST_RADIUS * FUSED_PROJ_BLAST_RADIUS;
+/** Proyectiles de fusión (burbuja / plasma / telequinesis) o burbuja enemiga. */
+function isFusionExplosionProjectile(ent) {
+  if (!ent || ent.dead || grabbedBody === ent.body) return false;
+  if (ent.shieldStuck || ent.shieldDropping) return false;
+  if (ent.state === 'friendly') {
+    return Boolean(ent.bubbleMode || ent.plasmaDir || ent.friendlyFlightDir);
+  }
+  if (ent.state === 'enemy') {
+    return Boolean(ent.bubbleMode);
+  }
+  return false;
+}
+
+function killDronesInSphere(cx, cy, cz, radius) {
+  const r2 = radius * radius;
   for (const d of drones) {
     if (d.dying) continue;
     const q = d.body.position;
-    const dx = q.x - px;
-    const dy = q.y - py;
-    const dz = q.z - pz;
+    const dx = q.x - cx;
+    const dy = q.y - cy;
+    const dz = q.z - cz;
     if (dx * dx + dy * dy + dz * dz <= r2) killDrone(d);
   }
+}
+
+const fusionExplosionTriggers = [];
+const fusionParticleBursts = [];
+const fusionExplosionLights = [];
+let fusionCameraShake = { x: 0, y: 0, z: 0 };
+
+function spawnFusionExplosionEffects(x, y, z, impactSpeed = 24) {
+  killDronesInSphere(x, y, z, 1.2);
+  fusionExplosionTriggers.push({
+    t: 0,
+    x,
+    y,
+    z,
+    maxR: FUSION_EXPLOSION_TRIGGER_MAX_RADIUS,
+    duration: FUSION_EXPLOSION_TRIGGER_DURATION,
+  });
+
+  const n = FUSION_EXPLOSION_PARTICLE_COUNT;
+  const positions = new Float32Array(n * 3);
+  const velocities = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const u = Math.random();
+    const v = Math.random();
+    const theta = u * Math.PI * 2;
+    const phi = Math.acos(2 * v - 1);
+    const sx = Math.sin(phi) * Math.cos(theta);
+    const sy = Math.sin(phi) * Math.sin(theta);
+    const sz = Math.cos(phi);
+    const spd = 5 + Math.random() * 16;
+    positions[i * 3] = x;
+    positions[i * 3 + 1] = y;
+    positions[i * 3 + 2] = z;
+    velocities[i * 3] = sx * spd;
+    velocities[i * 3 + 1] = sy * spd;
+    velocities[i * 3 + 2] = sz * spd;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0xffaa44,
+    size: 0.16,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 1,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const points = new THREE.Points(geo, mat);
+  scene.add(points);
+  fusionParticleBursts.push({
+    points,
+    geo,
+    mat,
+    velocities,
+    age: 0,
+    life: FUSION_EXPLOSION_PARTICLE_LIFE,
+  });
+
+  const light = new THREE.PointLight(0xff9933, 32, 48);
+  light.position.set(x, y, z);
+  scene.add(light);
+  fusionExplosionLights.push({ light, age: 0 });
+
+  const amp =
+    FUSION_EXPLOSION_SHAKE_BASE *
+    THREE.MathUtils.clamp(impactSpeed / 28, 0.35, 1.4);
+  fusionCameraShake.x += (Math.random() - 0.5) * 2 * amp;
+  fusionCameraShake.y += (Math.random() - 0.5) * 1.2 * amp;
+  fusionCameraShake.z += (Math.random() - 0.5) * 2 * amp;
+}
+
+function updateFusionExplosionTriggers(dt) {
+  if (isPaused) return;
+  for (let i = fusionExplosionTriggers.length - 1; i >= 0; i--) {
+    const tr = fusionExplosionTriggers[i];
+    tr.t += dt;
+    const r = Math.min(
+      tr.maxR,
+      (tr.t / tr.duration) * tr.maxR
+    );
+    killDronesInSphere(tr.x, tr.y, tr.z, r);
+    if (tr.t >= tr.duration) {
+      fusionExplosionTriggers.splice(i, 1);
+    }
+  }
+}
+
+function updateFusionParticleBursts(dt) {
+  for (let i = fusionParticleBursts.length - 1; i >= 0; i--) {
+    const b = fusionParticleBursts[i];
+    b.age += dt;
+    const pos = b.geo.attributes.position.array;
+    const v = b.velocities;
+    const n = FUSION_EXPLOSION_PARTICLE_COUNT;
+    for (let k = 0; k < n; k++) {
+      pos[k * 3] += v[k * 3] * dt;
+      pos[k * 3 + 1] += v[k * 3 + 1] * dt;
+      pos[k * 3 + 2] += v[k * 3 + 2] * dt;
+    }
+    b.geo.attributes.position.needsUpdate = true;
+    b.mat.opacity = Math.max(0, 1 - b.age / b.life);
+    if (b.age >= b.life) {
+      scene.remove(b.points);
+      b.geo.dispose();
+      b.mat.dispose();
+      fusionParticleBursts.splice(i, 1);
+    }
+  }
+}
+
+function updateFusionExplosionLights(dt) {
+  for (let i = fusionExplosionLights.length - 1; i >= 0; i--) {
+    const L = fusionExplosionLights[i];
+    L.age += dt;
+    const t = L.age / FUSION_EXPLOSION_LIGHT_DURATION;
+    L.light.intensity = 32 * Math.max(0, 1 - t);
+    if (L.age >= FUSION_EXPLOSION_LIGHT_DURATION) {
+      scene.remove(L.light);
+      L.light.dispose();
+      fusionExplosionLights.splice(i, 1);
+    }
+  }
+}
+
+function fuseProjectileExplode(ent) {
+  if (!ent || ent.dead) return;
+  const p = ent.body.position;
+  const vx = ent.body.velocity.x;
+  const vy = ent.body.velocity.y;
+  const vz = ent.body.velocity.z;
+  const sp = Math.hypot(vx, vy, vz);
+  spawnFusionExplosionEffects(p.x, p.y, p.z, sp);
   removeProjectile(ent);
 }
 
@@ -1607,6 +1794,10 @@ function resolveProjectileArenaTunneling() {
 
     const nh = Math.hypot(nx, nz);
     if (nh < 1e-6) continue;
+    if (isFusionExplosionProjectile(ent)) {
+      fuseProjectileExplode(ent);
+      continue;
+    }
     applyExplosiveBubbleBarrierBounce(
       ent,
       nx / nh,
@@ -1650,17 +1841,31 @@ function onProjectileCollide(ent, other, contact) {
 
   if (other === groundBody && ent.state === 'enemy') {
     if (ent.shieldStuck) return;
+    if (isFusionExplosionProjectile(ent)) {
+      fuseProjectileExplode(ent);
+      return;
+    }
     tryBubbleBounceFromContact(ent, contact, BUBBLE_GROUND_RESTITUTION);
     return;
   }
   if (ent.state === 'enemy' && isArenaWallBody(other)) {
     if (ent.shieldStuck) return;
+    if (isFusionExplosionProjectile(ent)) {
+      fuseProjectileExplode(ent);
+      return;
+    }
     tryBubbleBounceFromContact(ent, contact, BUBBLE_WALL_RESTITUTION);
     return;
   }
   if (other === playerBody && ent.state === 'enemy') {
     if (ent.shieldStuck) return;
     if (isBodyMagneticallyCaptured(ent.body)) return;
+    if (
+      ent.shieldDropping &&
+      performance.now() < (ent.shieldDropPlayerImmuneUntil ?? 0)
+    ) {
+      return;
+    }
     removeProjectile(ent);
     triggerDamageFeedback();
     return;
@@ -1668,12 +1873,28 @@ function onProjectileCollide(ent, other, contact) {
   if (ent.state === 'friendly') {
     if (other === playerBody) return;
     if (other === groundBody) {
+      if (isFusionExplosionProjectile(ent)) {
+        fuseProjectileExplode(ent);
+        return;
+      }
       tryBubbleBounceFromContact(ent, contact, BUBBLE_GROUND_RESTITUTION);
       return;
     }
     if (isArenaWallBody(other)) {
+      if (isFusionExplosionProjectile(ent)) {
+        fuseProjectileExplode(ent);
+        return;
+      }
       tryBubbleBounceFromContact(ent, contact, BUBBLE_WALL_RESTITUTION);
       return;
+    }
+    const cubeHit = cubeMeshes.find((m) => m.userData.body === other);
+    if (cubeHit && isFusionExplosionProjectile(ent)) {
+      const sp = ent.body.velocity.length();
+      if (sp >= FUSION_IMPACT_MIN_SPEED_CUBE) {
+        fuseProjectileExplode(ent);
+        return;
+      }
     }
   }
 }
@@ -1709,19 +1930,30 @@ function restoreProjectileShieldStuckVisual(ent) {
 }
 
 function releaseShieldStuckProjectiles() {
+  computeShieldFrame();
   for (const ent of enemyProjectiles) {
     if (!ent.shieldStuck) continue;
     restoreProjectileShieldStuckVisual(ent);
     ent.shieldStuck = false;
     ent.shieldDropping = true;
     ent.shieldDropSec = SHIELD_DROP_SEC;
+    /** Evita daño al soltar: la bala estaba en el plano del escudo y solapa la hitbox del jugador. */
+    ent.shieldDropPlayerImmuneUntil = performance.now() + 520;
     delete ent.enemyDir;
     delete ent.shieldStickU;
     delete ent.shieldStickV;
     const b = ent.body;
-    b.wakeUp();
-    b.velocity.set(0, 0, 0);
-    b.angularVelocity.set(0, 0, 0);
+    /** Empujar hacia delante (hacia la mira) para separar del centro del jugador. */
+    const push = 0.58;
+    b.position.x += _shieldNormal.x * push;
+    b.position.y += _shieldNormal.y * push;
+    b.position.z += _shieldNormal.z * push;
+    applyMagnetReleasedProjectileFall(
+      ent,
+      _shieldNormal.x * 0.35,
+      -2.2,
+      _shieldNormal.z * 0.35
+    );
   }
 }
 
@@ -2758,6 +2990,11 @@ function animate() {
     syncPlayerHitBody();
 
     updateMagneticFusion(dt);
+    /** Escudo/vórtice sueltos antes del paso de física: si no, un frame con captura/gravedad anulada deja cubos y balas flotando. */
+    if (!shieldPressed) {
+      releaseAllMagneticCapture();
+      releaseShieldStuckProjectiles();
+    }
     world.fixedStep((1 / 60) * physicsTimeScale, 20);
     syncMeshesFromPhysics();
     syncDroneMeshes();
@@ -2771,6 +3008,10 @@ function animate() {
     updateShieldStuckProjectiles();
     updateDronesDeath(dt);
   }
+
+  updateFusionExplosionTriggers(dt);
+  updateFusionParticleBursts(dt);
+  updateFusionExplosionLights(dt);
 
   if (controls.isLocked) {
     const showShield = !isPaused && shieldPressed;
@@ -2826,7 +3067,17 @@ function animate() {
     clearGrabGlow();
   }
 
+  const _shakeD = Math.pow(0.84, dt * 60);
+  fusionCameraShake.x *= _shakeD;
+  fusionCameraShake.y *= _shakeD;
+  fusionCameraShake.z *= _shakeD;
+  camera.position.x += fusionCameraShake.x;
+  camera.position.y += fusionCameraShake.y;
+  camera.position.z += fusionCameraShake.z;
   composer.render();
+  camera.position.x -= fusionCameraShake.x;
+  camera.position.y -= fusionCameraShake.y;
+  camera.position.z -= fusionCameraShake.z;
 
   if (sceneHUD.visible) {
     const prev = renderer.autoClear;
