@@ -75,9 +75,82 @@
       #pauseOverlay.visible {
         opacity: 1;
       }
+      #gameHud {
+        position: fixed;
+        top: 14px;
+        right: 18px;
+        z-index: 5;
+        color: #e8e8f0;
+        font-size: 14px;
+        text-align: right;
+        line-height: 1.5;
+        pointer-events: none;
+        text-shadow: 0 1px 8px rgba(0, 0, 0, 0.85);
+      }
+      #gameHud .hud-row {
+        margin-bottom: 2px;
+      }
+      #gameHud #hudLives {
+        color: #ff6b8a;
+        letter-spacing: 0.15em;
+        font-size: 15px;
+      }
+      #gameOverOverlay {
+        position: fixed;
+        inset: 0;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: rgba(8, 6, 14, 0.92);
+        z-index: 8;
+        cursor: pointer;
+        color: #f0e8f8;
+        text-align: center;
+        padding: 24px;
+      }
+      #gameOverOverlay.visible {
+        display: flex;
+      }
+      #gameOverOverlay h2 {
+        font-size: 1.75rem;
+        font-weight: 700;
+        margin-bottom: 16px;
+        letter-spacing: 0.06em;
+      }
+      #gameOverOverlay p {
+        opacity: 0.9;
+        line-height: 1.55;
+      }
+      #gameOverScore {
+        font-size: 1.35rem;
+        font-weight: 600;
+        color: #ffcc66;
+      }
     </style>
   </head>
   <body>
+    <div id="gameHud" aria-live="polite">
+      <div class="hud-row" id="hudKills">Derrotados: 0</div>
+      <div class="hud-row" id="hudTime">00:00</div>
+      <div class="hud-row" id="hudWave">Ola 1</div>
+      <div class="hud-row" id="hudLives">♥♥♥</div>
+    </div>
+    <div
+      id="gameOverOverlay"
+      role="dialog"
+      aria-hidden="true"
+      aria-labelledby="gameOverTitle"
+    >
+      <h2 id="gameOverTitle">Game Over</h2>
+      <p>
+        Puntuación (enemigos derrotados):
+        <span id="gameOverScore">0</span>
+      </p>
+      <p style="margin-top: 14px; font-size: 0.95rem; opacity: 0.8">
+        Clic para jugar de nuevo
+      </p>
+    </div>
     <div id="pauseOverlay" aria-hidden="true">PAUSA · P</div>
     <div id="damageFlash" aria-hidden="true"></div>
     <div id="blocker">

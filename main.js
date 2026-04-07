@@ -51,10 +51,15 @@ const CUBE_KILL_DRONE_SPEED = 16;
 const DRONE_DEATH_SHRINK_SPEED = 7;
 const DRONE_FLASH_SEC = 0.12;
 const MAX_DRONES = 36;
+/** Enemigo élite: más grande, escudo morado; solo muere por explosión de combinación. */
+const ELITE_DRONE_RADIUS = 0.62;
+const ELITE_DRONE_MASS = 1.05;
+/** Cada N enemigos normales derrotados aparece un élite. */
+const ELITE_SPAWN_EVERY_NORMAL_KILLS = 10;
 
 /** --- Prueba: `true` = no spawn de drones; `TEST_MODE_DUAL_MG` = dos ametralladoras fijas. */
-const TEST_MODE_NO_DRONES = true;
-const TEST_MODE_DUAL_MG = true;
+const TEST_MODE_NO_DRONES = false;
+const TEST_MODE_DUAL_MG = false;
 const TEST_MG_FIRE_INTERVAL = 3;
 const TEST_MG_A = Object.freeze({ x: -20, y: 1.6, z: -35 });
 const TEST_MG_B = Object.freeze({ x: 24, y: 1.8, z: 30 });
@@ -123,8 +128,8 @@ const BUBBLE_MAX_SPEED = 40;
 const BUBBLE_MIN_SPEED = 20;
 /** Impulso aleatorio suave (rompe rebotes perfectos hacia la misma línea). */
 const BUBBLE_RANDOM_IMPULSE = 1.35;
-/** Explosión proyectil fusionado: trigger invisible 0→radio en 0,2 s; partículas 1 s. */
-const FUSION_EXPLOSION_TRIGGER_DURATION = 0.2;
+/** Explosión de combinación: barrido esférico invisible (radio 0→max) en 0,5 s; partículas amarillas. */
+const FUSION_EXPLOSION_TRIGGER_DURATION = 0.5;
 const FUSION_EXPLOSION_TRIGGER_MAX_RADIUS = 5;
 const FUSION_EXPLOSION_PARTICLE_COUNT = 80;
 const FUSION_EXPLOSION_PARTICLE_LIFE = 1;
@@ -412,12 +417,69 @@ let isPaused = false;
 const damageFlashEl = document.getElementById('damageFlash');
 let damageFlashTimer = 0;
 
+const hudKillsEl = document.getElementById('hudKills');
+const hudTimeEl = document.getElementById('hudTime');
+const hudWaveEl = document.getElementById('hudWave');
+const hudLivesEl = document.getElementById('hudLives');
+const gameOverOverlayEl = document.getElementById('gameOverOverlay');
+const gameOverScoreEl = document.getElementById('gameOverScore');
+
+let isGameOver = false;
+let enemiesDefeated = 0;
+/** Solo normales: cada N derrotados aparece un élite. */
+let normalKillsForElite = 0;
+let gameTimeSec = 0;
+let playerLives = 3;
+
+function formatTimeMMSS(totalSec) {
+  const s = Math.max(0, Math.floor(totalSec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+}
+
+function updateGameHud() {
+  if (hudKillsEl) hudKillsEl.textContent = `Derrotados: ${enemiesDefeated}`;
+  if (hudTimeEl) hudTimeEl.textContent = formatTimeMMSS(gameTimeSec);
+  const wave = Math.floor(enemiesDefeated / 10) + 1;
+  if (hudWaveEl) hudWaveEl.textContent = `Ola ${wave}`;
+  if (hudLivesEl) {
+    hudLivesEl.textContent = '♥'.repeat(Math.max(0, playerLives));
+  }
+}
+
 function triggerDamageFeedback() {
   damageFlashTimer = 0.35;
   if (damageFlashEl) damageFlashEl.style.opacity = '0.62';
 }
 
+function showGameOver() {
+  if (isGameOver) return;
+  isGameOver = true;
+  isPaused = false;
+  if (pauseOverlayEl) {
+    pauseOverlayEl.classList.remove('visible');
+    pauseOverlayEl.setAttribute('aria-hidden', 'true');
+  }
+  if (gameOverScoreEl) gameOverScoreEl.textContent = String(enemiesDefeated);
+  if (gameOverOverlayEl) {
+    gameOverOverlayEl.classList.add('visible');
+    gameOverOverlayEl.setAttribute('aria-hidden', 'false');
+  }
+  controls.unlock();
+  blocker.classList.add('hidden');
+}
+
+function onPlayerHit() {
+  if (isGameOver) return;
+  playerLives -= 1;
+  triggerDamageFeedback();
+  updateGameHud();
+  if (playerLives <= 0) showGameOver();
+}
+
 document.addEventListener('click', () => {
+  if (isGameOver) return;
   if (!controls.isLocked) {
     controls.lock();
   }
@@ -859,18 +921,7 @@ function detonateExplosiveCube(mesh) {
   if (!mesh?.userData?.isExplosiveCube || mesh.userData._exploded) return;
   mesh.userData._exploded = true;
   const p = mesh.userData.body.position;
-  const px = p.x;
-  const py = p.y;
-  const pz = p.z;
-  const r2 = EXPLOSIVE_CUBE_BLAST_RADIUS * EXPLOSIVE_CUBE_BLAST_RADIUS;
-  for (const d of drones) {
-    if (d.dying) continue;
-    const q = d.body.position;
-    const dx = q.x - px;
-    const dy = q.y - py;
-    const dz = q.z - pz;
-    if (dx * dx + dy * dy + dz * dz <= r2) killDrone(d);
-  }
+  killDronesInSphere(p.x, p.y, p.z, EXPLOSIVE_CUBE_BLAST_RADIUS, true);
   removeCubeMesh(mesh);
 }
 
@@ -1351,6 +1402,15 @@ const cubePositions = [
 cubePositions.forEach((p, i) => addCube(p[0], p[1], p[2], boxColors[i % boxColors.length]));
 
 const droneGeo = new THREE.SphereGeometry(DRONE_RADIUS, 20, 20);
+const eliteDroneGeo = new THREE.SphereGeometry(ELITE_DRONE_RADIUS, 22, 22);
+const eliteShieldGeo = new THREE.SphereGeometry(1, 18, 18);
+const eliteShieldMat = new THREE.MeshBasicMaterial({
+  color: 0x9933ff,
+  transparent: true,
+  opacity: 0.34,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+});
 const drones = [];
 
 function randomSpawnPointAroundPlayer() {
@@ -1375,23 +1435,31 @@ function randomPersonalOffset() {
   };
 }
 
-function createDrone(x, y, z) {
+function createDrone(x, y, z, opts = {}) {
+  const elite = opts.elite === true;
+  const geo = elite ? eliteDroneGeo : droneGeo;
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x4a4a55,
+    color: elite ? 0x5a4868 : 0x4a4a55,
     metalness: 0.9,
     roughness: 0.22,
-    emissive: 0xff0505,
-    emissiveIntensity: 1.35,
+    emissive: elite ? 0x7722ff : 0xff0505,
+    emissiveIntensity: elite ? 1.7 : 1.35,
   });
-  const mesh = new THREE.Mesh(droneGeo, mat);
+  const mesh = new THREE.Mesh(geo, mat);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   mesh.position.set(x, y, z);
+  if (elite) {
+    const shield = new THREE.Mesh(eliteShieldGeo, eliteShieldMat);
+    shield.scale.setScalar(1.26);
+    mesh.add(shield);
+  }
   scene.add(mesh);
 
-  const shape = new CANNON.Sphere(DRONE_RADIUS);
+  const radius = elite ? ELITE_DRONE_RADIUS : DRONE_RADIUS;
+  const shape = new CANNON.Sphere(radius);
   const body = new CANNON.Body({
-    mass: DRONE_MASS,
+    mass: elite ? ELITE_DRONE_MASS : DRONE_MASS,
     linearDamping: 0.58,
     angularDamping: 0.82,
     position: new CANNON.Vec3(x, y, z),
@@ -1402,6 +1470,7 @@ function createDrone(x, y, z) {
   const drone = {
     mesh,
     body,
+    elite,
     dying: false,
     deathPhase: 0,
     personalOffset: randomPersonalOffset(),
@@ -1424,14 +1493,36 @@ function createDrone(x, y, z) {
   return drone;
 }
 
-function killDrone(drone) {
+function createEliteDrone(x, y, z) {
+  return createDrone(x, y, z, { elite: true });
+}
+
+function killDrone(drone, opts = {}) {
+  const allowElite = opts.allowEliteKill === true;
   if (drone.dying) return;
+  if (drone.elite && !allowElite) return;
   drone.dying = true;
   drone.deathPhase = 0;
   world.removeBody(drone.body);
   drone.mesh.material.emissive.setHex(0xff6666);
   drone.mesh.material.emissiveIntensity = 5;
   drone.mesh.material.color.setHex(0xffffff);
+
+  enemiesDefeated += 1;
+  if (!drone.elite) {
+    normalKillsForElite += 1;
+    if (
+      normalKillsForElite % ELITE_SPAWN_EVERY_NORMAL_KILLS === 0 &&
+      !isGameOver
+    ) {
+      const alive = drones.filter((d) => !d.dying).length;
+      if (alive < MAX_DRONES) {
+        const p = randomSpawnPointAroundPlayer();
+        createEliteDrone(p.x, p.y, p.z);
+      }
+    }
+  }
+  updateGameHud();
 }
 
 const _droneToPlayer = new CANNON.Vec3();
@@ -1541,15 +1632,22 @@ function isFusionExplosionProjectile(ent) {
   return false;
 }
 
-function killDronesInSphere(cx, cy, cz, radius) {
+/**
+ * Daño en área: `comboExplosion` = explosión de fusión (bala+cubo, burbuja, etc.); ahí sí mueren élitos.
+ * Esfera lógica = mismo radio que una THREE.SphereGeometry(r) (sin mesh; solo consultas a distancia).
+ */
+function killDronesInSphere(cx, cy, cz, radius, comboExplosion = false) {
   const r2 = radius * radius;
   for (const d of drones) {
     if (d.dying) continue;
+    if (d.elite && !comboExplosion) continue;
     const q = d.body.position;
     const dx = q.x - cx;
     const dy = q.y - cy;
     const dz = q.z - cz;
-    if (dx * dx + dy * dy + dz * dz <= r2) killDrone(d);
+    if (dx * dx + dy * dy + dz * dz <= r2) {
+      killDrone(d, { allowEliteKill: comboExplosion });
+    }
   }
 }
 
@@ -1557,9 +1655,19 @@ const fusionExplosionTriggers = [];
 const fusionParticleBursts = [];
 const fusionExplosionLights = [];
 let fusionCameraShake = { x: 0, y: 0, z: 0 };
+/** Esfera invisible (solo THREE): escala con el radio del barrido de daño. */
+const COMBO_EXPLOSION_PROBE_GEO = new THREE.SphereGeometry(1, 22, 16);
+const COMBO_EXPLOSION_PROBE_MAT = new THREE.MeshBasicMaterial({
+  visible: false,
+});
 
 function spawnFusionExplosionEffects(x, y, z, impactSpeed = 24) {
-  killDronesInSphere(x, y, z, 1.2);
+  killDronesInSphere(x, y, z, 1.2, true);
+  const probe = new THREE.Mesh(COMBO_EXPLOSION_PROBE_GEO, COMBO_EXPLOSION_PROBE_MAT);
+  probe.visible = false;
+  probe.position.set(x, y, z);
+  probe.scale.setScalar(1.2);
+  scene.add(probe);
   fusionExplosionTriggers.push({
     t: 0,
     x,
@@ -1567,6 +1675,7 @@ function spawnFusionExplosionEffects(x, y, z, impactSpeed = 24) {
     z,
     maxR: FUSION_EXPLOSION_TRIGGER_MAX_RADIUS,
     duration: FUSION_EXPLOSION_TRIGGER_DURATION,
+    probe,
   });
 
   const n = FUSION_EXPLOSION_PARTICLE_COUNT;
@@ -1591,7 +1700,7 @@ function spawnFusionExplosionEffects(x, y, z, impactSpeed = 24) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const mat = new THREE.PointsMaterial({
-    color: 0xffaa44,
+    color: 0xffee22,
     size: 0.16,
     sizeAttenuation: true,
     transparent: true,
@@ -1610,7 +1719,7 @@ function spawnFusionExplosionEffects(x, y, z, impactSpeed = 24) {
     life: FUSION_EXPLOSION_PARTICLE_LIFE,
   });
 
-  const light = new THREE.PointLight(0xff9933, 32, 48);
+  const light = new THREE.PointLight(0xffdd33, 36, 52);
   light.position.set(x, y, z);
   scene.add(light);
   fusionExplosionLights.push({ light, age: 0 });
@@ -1632,8 +1741,15 @@ function updateFusionExplosionTriggers(dt) {
       tr.maxR,
       (tr.t / tr.duration) * tr.maxR
     );
-    killDronesInSphere(tr.x, tr.y, tr.z, r);
+    killDronesInSphere(tr.x, tr.y, tr.z, r, true);
+    if (tr.probe) {
+      tr.probe.position.set(tr.x, tr.y, tr.z);
+      tr.probe.scale.setScalar(Math.max(0.02, r));
+    }
     if (tr.t >= tr.duration) {
+      if (tr.probe) {
+        scene.remove(tr.probe);
+      }
       fusionExplosionTriggers.splice(i, 1);
     }
   }
@@ -1867,7 +1983,7 @@ function onProjectileCollide(ent, other, contact) {
       return;
     }
     removeProjectile(ent);
-    triggerDamageFeedback();
+    onPlayerHit();
     return;
   }
   if (ent.state === 'friendly') {
@@ -2806,6 +2922,7 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.code === 'KeyP' && !e.repeat) {
+    if (isGameOver) return;
     isPaused = !isPaused;
     if (pauseOverlayEl) {
       pauseOverlayEl.classList.toggle('visible', isPaused);
@@ -2867,7 +2984,9 @@ function animate() {
     }
   }
 
-  if (controls.isLocked && !isPaused) {
+  if (controls.isLocked && !isPaused && !isGameOver) {
+    gameTimeSec += dt;
+    updateGameHud();
     forward.set(0, 0, -1).applyQuaternion(camera.quaternion);
     forward.y = 0;
     if (forward.lengthSq() > 1e-6) forward.normalize();
@@ -2934,7 +3053,7 @@ function animate() {
   );
   leftHandSprite.position.set(handLeftBaseX, handBaseY, 0);
 
-  if (controls.isLocked && !isPaused) {
+  if (controls.isLocked && !isPaused && !isGameOver) {
     if (!TEST_MODE_NO_DRONES) {
       spawnTimer += dt;
       if (spawnTimer >= SPAWN_INTERVAL) {
@@ -2975,13 +3094,13 @@ function animate() {
         );
       }
     }
-  } else if (!controls.isLocked) {
+  } else if (!controls.isLocked || isGameOver) {
     spawnTimer = 0;
     testMgTimerA = 0;
     testMgTimerB = 0;
   }
 
-  if (!isPaused) {
+  if (!isPaused && !isGameOver) {
     playerTarget.position.copy(camera.position);
 
     updateBulletTimeAndPhysicsScale();
@@ -3100,5 +3219,11 @@ window.addEventListener('resize', () => {
   composer.setSize(window.innerWidth, window.innerHeight);
   updateHudLayout();
 });
+
+if (gameOverOverlayEl) {
+  gameOverOverlayEl.addEventListener('click', () => location.reload());
+}
+
+updateGameHud();
 
 animate();
