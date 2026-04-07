@@ -5,7 +5,8 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import * as CANNON from 'cannon-es';
 
-const PLAYER_EYE_HEIGHT = 1.65;
+/** Altura de los ojos respecto al suelo (m). ~1,74 ≈ persona ~1,80 m; más alto que antes para apuntar abajo sin “clavar” en el plano. */
+const PLAYER_EYE_HEIGHT = 1.74;
 const MOVE_SPEED = 12;
 /** Alcance máximo del rayo de telequinesis (más pequeño = “escudo” más ajustado). */
 const GRAB_REACH = 18;
