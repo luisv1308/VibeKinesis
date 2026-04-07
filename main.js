@@ -65,14 +65,63 @@ const HAND_KICK_Y = 18;
 const PROJ_MAX_PATH_TRAVEL = 85;
 /** Segundos máximos de vida (respaldo). */
 const PROJ_MAX_LIFE = 40;
+/** Fusión bala+bala → rayo plasma (aliado, atraviesa drones). */
+const PROJ_PLASMA_SPEED = 64;
+const PROJ_PLASMA_MAX_PATH = 240;
+const PROJ_PLASMA_PIERCE_COUNT = 16;
+/** Cada fusión bala+bala sobre el plasma ya agarrado: más grande y más penetraciones. */
+const PLASMA_MAX_TIER = 14;
+const PLASMA_RADIUS_GROWTH = 1.082;
+const PLASMA_PIERCE_PER_STACK = 5;
+const PLASMA_VISUAL_GROW_PER_TIER = 0.1;
+const PLASMA_PICK_SCALE_PER_TIER = 0.085;
+/** Cubo+bala → explosión al impacto fuerte / suelo / dron. */
+const EXPLOSIVE_CUBE_BLAST_RADIUS = 5.2;
+const EXPLOSIVE_ARM_DELAY_MS = 380;
+const EXPLOSIVE_DETONATE_SPEED = 2.0;
+/** Cubo+cubo → mega bloque (2 m de lado). */
+const MEGA_CUBE_HALF = 1;
+const MEGA_CUBE_MASS = 6;
+const MEGA_CUBE_COLOR = 0x6a7a9e;
+/** Telaraña: vibración visual y resaltado del par (Tab). */
+const VORTEX_JITTER_AMP = 0.024;
+const FUSION_PREVIEW_GLOW = 0xffdd44;
+const FUSION_PREVIEW_INTENSITY_CUBE = 1.05;
+const FUSION_PREVIEW_INTENSITY_PROJ = 2.35;
+/** Rebote de balas aliadas contra el suelo (antes se borraban al instante). */
+const FRIENDLY_GROUND_RESTITUTION = 0.7;
+const FRIENDLY_GROUND_BOUNCE_MIN_SPEED = 2.6;
 /** Mismo límite horizontal que el jugador (cámara clamp ±ARENA_HALF). Fuera → se elimina el disparo enemigo. */
 const ARENA_HALF = 58;
 const ARENA_Y_MIN = -2;
 const ARENA_Y_MAX = 80;
 
+/** Combinación magnética (escudo + vórtice). */
+const VORTEX_RADIUS = 3;
+const VORTEX_DIST = 2.05;
+const VORTEX_LERP = 7;
+const VORTEX_ORBIT_R = 0.48;
+const FUSION_SPEED = 32;
+/** Distancia entre centros para completar fusión (subir si falla cubo↔bala). */
+const FUSION_MERGE_DIST = 0.38;
+/** Tras lanzar con RMB, no volver a atrapar en el vórtice (evita anular el disparo). */
+const VORTEX_LAUNCH_IMMUNE_MS = 1200;
+/** Máximo de cuerpos en la telaraña magnética (cubos + proyectiles). */
+const VORTEX_MAX_CAPTURED = 5;
+
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -28, 0) });
 world.allowSleep = true;
 world.broadphase = new CANNON.SAPBroadphase(world);
+
+/** Proyectiles enemigos: grupo propio para no chocar entre sí. */
+const COLLISION_GROUP_ENEMY_PROJECTILE = 2;
+const COLLISION_MASK_ENEMY_PROJECTILE = -1 ^ COLLISION_GROUP_ENEMY_PROJECTILE;
+/**
+ * Pareja en fusión magnética: filtros cruzados para que no colisionen entre sí
+ * (el proyectil es muy ligero y el solver lo expulsaba del cubo cada frame).
+ */
+const COLLISION_GROUP_FUSION_A = 32;
+const COLLISION_GROUP_FUSION_B = 64;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0c0c14);
@@ -341,6 +390,8 @@ controls.addEventListener('lock', () => {
 controls.addEventListener('unlock', () => {
   blocker.classList.remove('hidden');
   shieldPressed = false;
+  abortMagneticFusionKeepBodies();
+  releaseAllMagneticCapture();
   releaseShieldStuckProjectiles();
   if (grabbedBody) {
     const mesh = meshFromBody(grabbedBody);
@@ -351,6 +402,8 @@ controls.addEventListener('unlock', () => {
 
 window.addEventListener('blur', () => {
   shieldPressed = false;
+  abortMagneticFusionKeepBodies();
+  releaseAllMagneticCapture();
   releaseShieldStuckProjectiles();
 });
 
@@ -453,6 +506,658 @@ const _shieldBasisRight = new THREE.Vector3();
 const _shieldBasisUp = new THREE.Vector3();
 const _pinShieldPos = new THREE.Vector3();
 const _worldUpY = new THREE.Vector3(0, 1, 0);
+const _vortexPt = new THREE.Vector3();
+const _vortexSlot = new THREE.Vector3();
+const _fusionMid = new THREE.Vector3();
+const _plasmaFireDir = new THREE.Vector3();
+const fusionLinePositions = new Float32Array(6);
+const fusionLineGeo = new THREE.BufferGeometry();
+fusionLineGeo.setAttribute(
+  'position',
+  new THREE.BufferAttribute(fusionLinePositions, 3)
+);
+const fusionLine = new THREE.Line(
+  fusionLineGeo,
+  new THREE.LineBasicMaterial({ color: 0xffdd22 })
+);
+fusionLine.visible = false;
+fusionLine.frustumCulled = false;
+scene.add(fusionLine);
+
+/** @type {{ mat: THREE.Material, emissive: THREE.Color, emissiveIntensity: number }[]} */
+let fusionPreviewGlowStack = [];
+/** @type {{ mat: THREE.Material, emissive: THREE.Color, emissiveIntensity: number }[]} */
+let fusionActiveGlowStack = [];
+
+/** Objetos atrapados por el vórtice (escudo activo). */
+const capturedObjects = [];
+let fusionPairCursor = 0;
+/** @type {null | { entryA: object, entryB: object }} */
+let fusionState = null;
+
+function getFusionPairCount(n) {
+  return n >= 2 ? (n * (n - 1)) / 2 : 0;
+}
+
+function getFusionPairIndices(n, pairIdx) {
+  let k = 0;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      if (k === pairIdx) return [i, j];
+      k++;
+    }
+  }
+  return [0, 1];
+}
+
+function isBodyMagneticallyCaptured(body) {
+  return capturedObjects.some((c) => c.body === body);
+}
+
+function isBodyInMagneticFusion(body) {
+  if (!fusionState || !body) return false;
+  return (
+    fusionState.entryA.body === body ||
+    fusionState.entryB.body === body
+  );
+}
+
+function getFusionMatFromCaptureEntry(entry) {
+  if (!entry) return null;
+  if (entry.kind === 'cube' && entry.mesh?.material) return entry.mesh.material;
+  if (entry.projectileEnt?.visualMesh?.material)
+    return entry.projectileEnt.visualMesh.material;
+  return null;
+}
+
+function pushFusionGlow(stack, mat, emissiveIntensity) {
+  if (!mat?.emissive) return;
+  stack.push({
+    mat,
+    emissive: mat.emissive.clone(),
+    emissiveIntensity: mat.emissiveIntensity,
+  });
+  mat.emissive.setHex(FUSION_PREVIEW_GLOW);
+  mat.emissiveIntensity = emissiveIntensity;
+  mat.needsUpdate = true;
+}
+
+function popFusionGlowStack(stack) {
+  for (const s of stack) {
+    if (!s.mat?.emissive) continue;
+    s.mat.emissive.copy(s.emissive);
+    s.mat.emissiveIntensity = s.emissiveIntensity;
+    s.mat.needsUpdate = true;
+  }
+  stack.length = 0;
+}
+
+function clearFusionPreviewGlow() {
+  popFusionGlowStack(fusionPreviewGlowStack);
+}
+
+function clearFusionActiveGlow() {
+  popFusionGlowStack(fusionActiveGlowStack);
+}
+
+function getMagneticFusionRecipe(entryA, entryB) {
+  const cubes =
+    (entryA.kind === 'cube' ? 1 : 0) + (entryB.kind === 'cube' ? 1 : 0);
+  const projs =
+    (entryA.kind === 'projectile' ? 1 : 0) +
+    (entryB.kind === 'projectile' ? 1 : 0);
+  if (cubes === 2) return 'mega';
+  if (projs === 2) return 'plasma';
+  return 'explosive';
+}
+
+function applyFusionPairCollisionIsolation(entryA, entryB) {
+  for (const entry of [entryA, entryB]) {
+    const b = entry?.body;
+    if (!b) continue;
+    entry._fusionCollisionSave = {
+      collisionFilterGroup: b.collisionFilterGroup,
+      collisionFilterMask: b.collisionFilterMask,
+    };
+  }
+  const maskA = -1 ^ COLLISION_GROUP_FUSION_B;
+  const maskB = -1 ^ COLLISION_GROUP_FUSION_A;
+  entryA.body.collisionFilterGroup = COLLISION_GROUP_FUSION_A;
+  entryA.body.collisionFilterMask = maskA;
+  entryB.body.collisionFilterGroup = COLLISION_GROUP_FUSION_B;
+  entryB.body.collisionFilterMask = maskB;
+}
+
+function restoreFusionPairCollisionFromEntries(entryA, entryB) {
+  for (const entry of [entryA, entryB]) {
+    const b = entry?.body;
+    const s = entry?._fusionCollisionSave;
+    if (!b || !s) continue;
+    b.collisionFilterGroup = s.collisionFilterGroup;
+    b.collisionFilterMask = s.collisionFilterMask;
+    delete entry._fusionCollisionSave;
+  }
+}
+
+function abortMagneticFusionKeepBodies() {
+  if (!fusionState) return;
+  const { entryA, entryB } = fusionState;
+  restoreFusionPairCollisionFromEntries(entryA, entryB);
+  clearFusionActiveGlow();
+  fusionState = null;
+}
+
+function removeMagneticCaptureForBody(body) {
+  const idx = capturedObjects.findIndex((c) => c.body === body);
+  if (idx >= 0) {
+    clearVortexTransparencyIfNotGrabbed(capturedObjects[idx]);
+    capturedObjects.splice(idx, 1);
+  }
+}
+
+function releaseAllMagneticCapture() {
+  for (const c of capturedObjects) {
+    clearVortexTransparencyIfNotGrabbed(c);
+  }
+  capturedObjects.length = 0;
+  fusionPairCursor = 0;
+  fusionLine.visible = false;
+  clearFusionPreviewGlow();
+}
+
+function getVortexWorldPoint(out) {
+  out.copy(camera.position);
+  out.addScaledVector(_shieldNormal, VORTEX_DIST);
+  out.y += -0.12;
+  return out;
+}
+
+function removeCubeMesh(mesh) {
+  if (!mesh?.userData?.body) return;
+  removeMagneticCaptureForBody(mesh.userData.body);
+  const idx = cubeMeshes.indexOf(mesh);
+  if (idx < 0) return;
+  cubeMeshes.splice(idx, 1);
+  world.removeBody(mesh.userData.body);
+  mesh.material.dispose();
+  scene.remove(mesh);
+}
+
+function addExplosiveCube(x, y, z) {
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xb89a1e,
+    emissive: 0xffee44,
+    emissiveIntensity: 1.85,
+    metalness: 0.28,
+    roughness: 0.38,
+  });
+  const mesh = new THREE.Mesh(boxGeo, mat);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.position.set(x, y, z);
+  mesh.userData.isExplosiveCube = true;
+  scene.add(mesh);
+
+  const shape = new CANNON.Box(new CANNON.Vec3(0.5, 0.5, 0.5));
+  const body = new CANNON.Body({
+    mass: 1.2,
+    linearDamping: 0.08,
+    angularDamping: 0.2,
+    position: new CANNON.Vec3(x, y, z),
+  });
+  body.addShape(shape);
+  world.addBody(body);
+
+  mesh.userData.body = body;
+  mesh.userData.isGrabbable = true;
+  body.userData = { isCube: true };
+  cubeMeshes.push(mesh);
+  setupExplosiveCubeDetonation(mesh);
+  return mesh;
+}
+
+function detonateExplosiveCube(mesh) {
+  if (!mesh?.userData?.isExplosiveCube || mesh.userData._exploded) return;
+  mesh.userData._exploded = true;
+  const p = mesh.userData.body.position;
+  const px = p.x;
+  const py = p.y;
+  const pz = p.z;
+  const r2 = EXPLOSIVE_CUBE_BLAST_RADIUS * EXPLOSIVE_CUBE_BLAST_RADIUS;
+  for (const d of drones) {
+    if (d.dying) continue;
+    const q = d.body.position;
+    const dx = q.x - px;
+    const dy = q.y - py;
+    const dz = q.z - pz;
+    if (dx * dx + dy * dy + dz * dz <= r2) killDrone(d);
+  }
+  removeCubeMesh(mesh);
+}
+
+function setupExplosiveCubeDetonation(mesh) {
+  const body = mesh.userData.body;
+  mesh.userData.explosiveArmAt = performance.now() + EXPLOSIVE_ARM_DELAY_MS;
+  const onCollide = (e) => {
+    if (mesh.userData._exploded) return;
+    if (performance.now() < mesh.userData.explosiveArmAt) return;
+    const other = e.body;
+    if (other === playerBody) return;
+    const v = body.velocity.length();
+    const hitDrone = drones.some((d) => !d.dying && d.body === other);
+    const hitGround = other === groundBody;
+    const hitCube = cubeMeshes.some(
+      (m) => m !== mesh && m.userData.body === other
+    );
+    if (hitDrone) {
+      detonateExplosiveCube(mesh);
+      body.removeEventListener('collide', onCollide);
+      return;
+    }
+    if (hitGround && v >= EXPLOSIVE_DETONATE_SPEED) {
+      detonateExplosiveCube(mesh);
+      body.removeEventListener('collide', onCollide);
+      return;
+    }
+    if (hitCube && v > 9) {
+      detonateExplosiveCube(mesh);
+      body.removeEventListener('collide', onCollide);
+    }
+  };
+  body.addEventListener('collide', onCollide);
+}
+
+function addMegaBlock(x, y, z) {
+  const mat = new THREE.MeshStandardMaterial({
+    color: MEGA_CUBE_COLOR,
+    emissive: 0x223355,
+    emissiveIntensity: 0.35,
+    metalness: 0.35,
+    roughness: 0.42,
+  });
+  const mesh = new THREE.Mesh(boxGeo, mat);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.position.set(x, y, z);
+  mesh.scale.setScalar(MEGA_CUBE_HALF * 2);
+  mesh.userData.isMegaCube = true;
+  scene.add(mesh);
+
+  const shape = new CANNON.Box(
+    new CANNON.Vec3(MEGA_CUBE_HALF, MEGA_CUBE_HALF, MEGA_CUBE_HALF)
+  );
+  const body = new CANNON.Body({
+    mass: MEGA_CUBE_MASS,
+    linearDamping: 0.06,
+    angularDamping: 0.18,
+    position: new CANNON.Vec3(x, y, z),
+  });
+  body.addShape(shape);
+  world.addBody(body);
+
+  mesh.userData.body = body;
+  mesh.userData.isGrabbable = true;
+  body.userData = { isCube: true };
+  cubeMeshes.push(mesh);
+  return mesh;
+}
+
+function tryStartMagneticFusion() {
+  if (fusionState || isPaused || !controls.isLocked) return;
+  const n = capturedObjects.length;
+  if (n < 2) return;
+  const nPairs = getFusionPairCount(n);
+  if (nPairs < 1) return;
+  const idx = fusionPairCursor % nPairs;
+  const [i, j] = getFusionPairIndices(n, idx);
+  const hi = Math.max(i, j);
+  const lo = Math.min(i, j);
+  const entryB = capturedObjects[hi];
+  const entryA = capturedObjects[lo];
+  capturedObjects.splice(hi, 1);
+  capturedObjects.splice(lo, 1);
+  clearVortexTransparencyIfNotGrabbed(entryA);
+  clearVortexTransparencyIfNotGrabbed(entryB);
+
+  _fusionMid.set(
+    (entryA.body.position.x + entryB.body.position.x) * 0.5,
+    (entryA.body.position.y + entryB.body.position.y) * 0.5,
+    (entryA.body.position.z + entryB.body.position.z) * 0.5
+  );
+  clearFusionPreviewGlow();
+  clearFusionActiveGlow();
+  const ma = getFusionMatFromCaptureEntry(entryA);
+  const mb = getFusionMatFromCaptureEntry(entryB);
+  if (ma) {
+    pushFusionGlow(
+      fusionActiveGlowStack,
+      ma,
+      entryA.kind === 'cube'
+        ? FUSION_PREVIEW_INTENSITY_CUBE
+        : FUSION_PREVIEW_INTENSITY_PROJ
+    );
+  }
+  if (mb) {
+    pushFusionGlow(
+      fusionActiveGlowStack,
+      mb,
+      entryB.kind === 'cube'
+        ? FUSION_PREVIEW_INTENSITY_CUBE
+        : FUSION_PREVIEW_INTENSITY_PROJ
+    );
+  }
+  fusionState = { entryA, entryB };
+  applyFusionPairCollisionIsolation(entryA, entryB);
+}
+
+function completeMagneticFusion(entryA, entryB) {
+  const recipe = getMagneticFusionRecipe(entryA, entryB);
+  const x = _fusionMid.x;
+  const y = _fusionMid.y;
+  const z = _fusionMid.z;
+
+  clearFusionActiveGlow();
+  clearFusionPreviewGlow();
+
+  if (entryA.kind === 'cube') {
+    removeCubeMesh(entryA.mesh);
+  } else if (entryA.projectileEnt && !entryA.projectileEnt.dead) {
+    removeProjectile(entryA.projectileEnt);
+  }
+
+  if (entryB.kind === 'cube') {
+    removeCubeMesh(entryB.mesh);
+  } else if (entryB.projectileEnt && !entryB.projectileEnt.dead) {
+    removeProjectile(entryB.projectileEnt);
+  }
+
+  if (recipe === 'plasma') {
+    const heldPe = grabbedBody?.userData?.projectileEnt;
+    if (
+      heldPe?.plasmaDir &&
+      !heldPe.dead &&
+      heldPe.body === grabbedBody
+    ) {
+      growPlasmaProjectile(heldPe);
+      applyGrabTransparency(heldPe.visualMesh, GRAB_PLASMA_HELD_OPACITY);
+      physicsTimeScale = 1;
+      clearGrabGlow();
+      handExtendedUntil = performance.now() + HAND_EXTENDED_MS * 0.65;
+      handShakeX += (Math.random() - 0.5) * 6;
+      handShakeY += (Math.random() - 0.5) * 6;
+      return;
+    }
+    camera.getWorldDirection(_plasmaFireDir);
+    if (_plasmaFireDir.lengthSq() < 1e-6) {
+      _plasmaFireDir.set(0, 0, -1);
+    } else {
+      _plasmaFireDir.normalize();
+    }
+    const plasmaEnt = createPlasmaBolt(
+      x,
+      y,
+      z,
+      _plasmaFireDir.x,
+      _plasmaFireDir.y,
+      _plasmaFireDir.z,
+      true
+    );
+    grabbedBody = plasmaEnt.body;
+    applyGrabTransparency(plasmaEnt.visualMesh, GRAB_PLASMA_HELD_OPACITY);
+    physicsTimeScale = 1;
+    clearGrabGlow();
+    return;
+  }
+
+  let mesh;
+  if (recipe === 'mega') {
+    mesh = addMegaBlock(x, y, z);
+  } else {
+    mesh = addExplosiveCube(x, y, z);
+  }
+  const body = mesh.userData.body;
+  body.velocity.set(0, 0, 0);
+  body.angularVelocity.set(0, 0, 0);
+  grabbedBody = body;
+  applyGrabTransparency(mesh);
+  physicsTimeScale = 1;
+  clearGrabGlow();
+}
+
+function updateMagneticFusion(dt) {
+  if (!fusionState) return;
+  const { entryA, entryB } = fusionState;
+  const ba = entryA.body;
+  const bb = entryB.body;
+  if (!ba || !bb) {
+    abortMagneticFusionKeepBodies();
+    return;
+  }
+
+  _fusionMid.set(
+    (ba.position.x + bb.position.x) * 0.5,
+    (ba.position.y + bb.position.y) * 0.5,
+    (ba.position.z + bb.position.z) * 0.5
+  );
+
+  const step = FUSION_SPEED * dt;
+  for (const b of [ba, bb]) {
+    const dx = _fusionMid.x - b.position.x;
+    const dy = _fusionMid.y - b.position.y;
+    const dz = _fusionMid.z - b.position.z;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (d > 1e-5) {
+      const m = Math.min(step, d);
+      b.position.x += (dx / d) * m;
+      b.position.y += (dy / d) * m;
+      b.position.z += (dz / d) * m;
+    }
+    b.velocity.set(0, 0, 0);
+    b.angularVelocity.set(0, 0, 0);
+  }
+
+  const ox = ba.position.x - bb.position.x;
+  const oy = ba.position.y - bb.position.y;
+  const oz = ba.position.z - bb.position.z;
+  if (ox * ox + oy * oy + oz * oz < FUSION_MERGE_DIST * FUSION_MERGE_DIST) {
+    completeMagneticFusion(entryA, entryB);
+    fusionState = null;
+  }
+}
+
+function updateMagneticFusionLine() {
+  clearFusionPreviewGlow();
+  if (fusionState || capturedObjects.length < 2) {
+    fusionLine.visible = false;
+    return;
+  }
+  const n = capturedObjects.length;
+  const nPairs = getFusionPairCount(n);
+  if (nPairs < 1) {
+    fusionLine.visible = false;
+    return;
+  }
+  const [i, j] = getFusionPairIndices(n, fusionPairCursor % nPairs);
+  const ea = capturedObjects[i];
+  const eb = capturedObjects[j];
+  const pa = ea.body.position;
+  const pb = eb.body.position;
+  fusionLinePositions[0] = pa.x;
+  fusionLinePositions[1] = pa.y;
+  fusionLinePositions[2] = pa.z;
+  fusionLinePositions[3] = pb.x;
+  fusionLinePositions[4] = pb.y;
+  fusionLinePositions[5] = pb.z;
+  fusionLineGeo.attributes.position.needsUpdate = true;
+  fusionLine.visible = true;
+  const mia = getFusionMatFromCaptureEntry(ea);
+  const mib = getFusionMatFromCaptureEntry(eb);
+  if (mia) {
+    pushFusionGlow(
+      fusionPreviewGlowStack,
+      mia,
+      ea.kind === 'cube'
+        ? FUSION_PREVIEW_INTENSITY_CUBE
+        : FUSION_PREVIEW_INTENSITY_PROJ
+    );
+  }
+  if (mib) {
+    pushFusionGlow(
+      fusionPreviewGlowStack,
+      mib,
+      eb.kind === 'cube'
+        ? FUSION_PREVIEW_INTENSITY_CUBE
+        : FUSION_PREVIEW_INTENSITY_PROJ
+    );
+  }
+}
+
+function applyMagneticWebVisualJitter(timeMs) {
+  if (!shieldPressed || capturedObjects.length === 0) return;
+  const t = timeMs * 0.001;
+  let k = 0;
+  for (const c of capturedObjects) {
+    const ph = t * 10.2 + k * 2.1;
+    const jx = Math.sin(ph) * VORTEX_JITTER_AMP;
+    const jy = Math.cos(ph * 1.13) * VORTEX_JITTER_AMP;
+    const jz = Math.sin(ph * 0.91 + 0.7) * VORTEX_JITTER_AMP;
+    k++;
+    const b = c.body;
+    if (c.kind === 'cube' && c.mesh) {
+      c.mesh.position.set(b.position.x + jx, b.position.y + jy, b.position.z + jz);
+      c.mesh.quaternion.copy(b.quaternion);
+    } else if (c.projectileEnt) {
+      const g = c.projectileEnt.group;
+      g.position.set(b.position.x + jx, b.position.y + jy, b.position.z + jz);
+      g.quaternion.copy(b.quaternion);
+    }
+  }
+}
+
+function updateMagneticVortex(dt) {
+  if (isPaused || !controls.isLocked) {
+    releaseAllMagneticCapture();
+    return;
+  }
+  if (!shieldPressed) {
+    releaseAllMagneticCapture();
+    return;
+  }
+
+  computeShieldFrame();
+  getVortexWorldPoint(_vortexPt);
+
+  for (let i = capturedObjects.length - 1; i >= 0; i--) {
+    const c = capturedObjects[i];
+    const b = c.body;
+    if (
+      grabbedBody === b ||
+      (c.projectileEnt &&
+        (c.projectileEnt.dead ||
+          c.projectileEnt.shieldStuck ||
+          c.projectileEnt.shieldDropping))
+    ) {
+      clearVortexTransparencyIfNotGrabbed(c);
+      capturedObjects.splice(i, 1);
+      continue;
+    }
+    const dx = b.position.x - _vortexPt.x;
+    const dy = b.position.y - _vortexPt.y;
+    const dz = b.position.z - _vortexPt.z;
+    if (dx * dx + dy * dy + dz * dz > VORTEX_RADIUS * VORTEX_RADIUS) {
+      clearVortexTransparencyIfNotGrabbed(c);
+      capturedObjects.splice(i, 1);
+    }
+  }
+
+  if (!fusionState) {
+    const vortexR2 = VORTEX_RADIUS * VORTEX_RADIUS;
+    const candidates = [];
+
+    for (const mesh of cubeMeshes) {
+      const b = mesh.userData.body;
+      if (!b || grabbedBody === b) continue;
+      if (
+        mesh.userData.vortexImmuneUntil &&
+        performance.now() < mesh.userData.vortexImmuneUntil
+      ) {
+        continue;
+      }
+      if (isBodyMagneticallyCaptured(b)) continue;
+      const dx = b.position.x - _vortexPt.x;
+      const dy = b.position.y - _vortexPt.y;
+      const dz = b.position.z - _vortexPt.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 <= vortexR2) {
+        candidates.push({
+          distSq: d2,
+          entry: { kind: 'cube', body: b, mesh },
+        });
+      }
+    }
+
+    for (const ent of enemyProjectiles) {
+      if (ent.dead || grabbedBody === ent.body) continue;
+      if (ent.plasmaDir) continue;
+      if (ent.shieldStuck || ent.shieldDropping) continue;
+      if (
+        ent.vortexImmuneUntil &&
+        performance.now() < ent.vortexImmuneUntil
+      ) {
+        continue;
+      }
+      if (isBodyMagneticallyCaptured(ent.body)) continue;
+      const b = ent.body;
+      const dx = b.position.x - _vortexPt.x;
+      const dy = b.position.y - _vortexPt.y;
+      const dz = b.position.z - _vortexPt.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 <= vortexR2) {
+        candidates.push({
+          distSq: d2,
+          entry: {
+            kind: 'projectile',
+            body: b,
+            mesh: ent.group,
+            projectileEnt: ent,
+          },
+        });
+      }
+    }
+
+    candidates.sort((a, b) => a.distSq - b.distSq);
+    for (const { entry } of candidates) {
+      if (capturedObjects.length >= VORTEX_MAX_CAPTURED) break;
+      capturedObjects.push(entry);
+      if (entry.kind === 'cube') {
+        applyGrabTransparency(entry.mesh);
+      } else if (entry.projectileEnt?.visualMesh) {
+        applyGrabTransparency(
+          entry.projectileEnt.visualMesh,
+          GRAB_PROJECTILE_VORTEX_OPACITY
+        );
+      }
+    }
+  }
+
+  const n = capturedObjects.length;
+  const t = Math.min(1, VORTEX_LERP * dt);
+  for (let i = 0; i < n; i++) {
+    const b = capturedObjects[i].body;
+    const angle = (2 * Math.PI * i) / Math.max(1, n);
+    _vortexSlot
+      .copy(_vortexPt)
+      .addScaledVector(_shieldBasisRight, Math.cos(angle) * VORTEX_ORBIT_R)
+      .addScaledVector(_shieldBasisUp, Math.sin(angle) * VORTEX_ORBIT_R);
+    b.position.x += (_vortexSlot.x - b.position.x) * t;
+    b.position.y += (_vortexSlot.y - b.position.y) * t;
+    b.position.z += (_vortexSlot.z - b.position.z) * t;
+    b.velocity.set(0, 0, 0);
+    b.angularVelocity.x *= 0.82;
+    b.angularVelocity.y *= 0.82;
+    b.angularVelocity.z *= 0.82;
+  }
+}
 
 class EnemyBullet {
   constructor(ent) {
@@ -566,9 +1271,12 @@ function createDrone(x, y, z) {
   body.addEventListener('collide', (e) => {
     if (drone.dying) return;
     const other = e.body;
-    const hitCube = cubeMeshes.some((m) => m.userData.body === other);
-    if (!hitCube) return;
-    if (other.velocity.length() < CUBE_KILL_DRONE_SPEED) return;
+    const cubeMeshHit = cubeMeshes.find((m) => m.userData.body === other);
+    if (!cubeMeshHit) return;
+    const needSpeed = cubeMeshHit.userData.isMegaCube
+      ? CUBE_KILL_DRONE_SPEED * 0.48
+      : CUBE_KILL_DRONE_SPEED;
+    if (other.velocity.length() < needSpeed) return;
     killDrone(drone);
   });
 
@@ -676,10 +1384,57 @@ function syncDroneMeshes() {
   }
 }
 
+/**
+ * Rebota balas telequinéticas (y plasma) en el plano; actualiza dirección para vuelo recto.
+ * @returns {'dead'|'graze'|'bounced'}
+ */
+function bounceFriendlyProjectileOnGround(ent, contact) {
+  const b = ent.body;
+  let nx = 0;
+  let ny = 1;
+  let nz = 0;
+  if (contact?.ni) {
+    nx = -contact.ni.x;
+    ny = -contact.ni.y;
+    nz = -contact.ni.z;
+    const nlen = Math.hypot(nx, ny, nz);
+    if (nlen > 1e-6) {
+      nx /= nlen;
+      ny /= nlen;
+      nz /= nlen;
+    } else {
+      nx = 0;
+      ny = 1;
+      nz = 0;
+    }
+  }
+  const vx = b.velocity.x;
+  const vy = b.velocity.y;
+  const vz = b.velocity.z;
+  const vn = vx * nx + vy * ny + vz * nz;
+  if (vn >= -0.06) return 'graze';
+  const e = FRIENDLY_GROUND_RESTITUTION;
+  const outX = vx - (1 + e) * vn * nx;
+  const outY = vy - (1 + e) * vn * ny;
+  const outZ = vz - (1 + e) * vn * nz;
+  const sp = Math.hypot(outX, outY, outZ);
+  if (sp < FRIENDLY_GROUND_BOUNCE_MIN_SPEED) {
+    removeProjectile(ent);
+    return 'dead';
+  }
+  b.velocity.set(outX, outY, outZ);
+  const inv = 1 / sp;
+  ent.friendlyFlightDir = { x: outX * inv, y: outY * inv, z: outZ * inv };
+  ent.friendlyFlightSpeed = sp;
+  return 'bounced';
+}
+
 function captureProjectileVisual(ent) {
   ent.state = 'friendly';
   ent.pathTraveled = 0;
   delete ent.enemyDir;
+  delete ent.friendlyFlightDir;
+  delete ent.friendlyFlightSpeed;
   const mat = ent.visualMesh.material;
   mat.color.setHex(0x22eeff);
   mat.emissive.setHex(0x00ccff);
@@ -687,7 +1442,7 @@ function captureProjectileVisual(ent) {
   mat.needsUpdate = true;
 }
 
-function onProjectileCollide(ent, other) {
+function onProjectileCollide(ent, other, contact) {
   if (!ent || ent.dead) return;
   if (other === groundBody && ent.state === 'enemy') {
     if (ent.shieldStuck) return;
@@ -701,10 +1456,25 @@ function onProjectileCollide(ent, other) {
     return;
   }
   if (ent.state === 'friendly') {
+    if (other === playerBody) return;
+    if (other === groundBody) {
+      const br = bounceFriendlyProjectileOnGround(ent, contact);
+      if (br === 'bounced' && ent.plasmaDir) {
+        delete ent.plasmaDir;
+        ent.pathTraveled = 0;
+      }
+      return;
+    }
     const drone = drones.find((d) => !d.dying && d.body === other);
     if (drone) {
       killDrone(drone);
-      removeProjectile(ent);
+      if (ent.plasmaPierceLeft != null) {
+        ent.plasmaPierceLeft--;
+        if (ent.plasmaPierceLeft <= 0) removeProjectile(ent);
+      } else {
+        removeProjectile(ent);
+      }
+      return;
     }
   }
 }
@@ -833,6 +1603,8 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz) {
     angularDamping: 0.35,
     position: new CANNON.Vec3(sx, sy, sz),
     collisionResponse: true,
+    collisionFilterGroup: COLLISION_GROUP_ENEMY_PROJECTILE,
+    collisionFilterMask: COLLISION_MASK_ENEMY_PROJECTILE,
   });
   body.addShape(shape);
 
@@ -881,7 +1653,157 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz) {
   };
 
   body.addEventListener('collide', (e) => {
-    onProjectileCollide(ent, e.body);
+    onProjectileCollide(ent, e.body, e.contact);
+  });
+
+  world.addBody(body);
+  projectileMeshes.push(group);
+  enemyProjectiles.push(ent);
+  return ent;
+}
+
+function applyPlasmaTierToBody(ent) {
+  const tier = Math.min(
+    Math.max(1, ent.plasmaTier || 1),
+    PLASMA_MAX_TIER
+  );
+  ent.plasmaTier = tier;
+  const t = tier - 1;
+  const r = PROJ_RADIUS * Math.pow(PLASMA_RADIUS_GROWTH, t);
+  const visScale =
+    PROJ_VISUAL_SCALE * 1.15 * (1 + PLASMA_VISUAL_GROW_PER_TIER * t);
+  ent.visualMesh.scale.setScalar(visScale);
+  ent.pickMesh.scale.setScalar(1 + PLASMA_PICK_SCALE_PER_TIER * t);
+
+  const body = ent.body;
+  while (body.shapes.length > 0) {
+    body.removeShape(body.shapes[0]);
+  }
+  body.addShape(new CANNON.Sphere(r));
+  body.mass = PROJ_MASS * 0.9 * Math.pow(1.055, t);
+  body.updateMassProperties();
+}
+
+function growPlasmaProjectile(ent) {
+  ent.plasmaTier = Math.min(
+    (ent.plasmaTier || 1) + 1,
+    PLASMA_MAX_TIER
+  );
+  ent.plasmaPierceLeft += PLASMA_PIERCE_PER_STACK;
+  applyPlasmaTierToBody(ent);
+  const mat = ent.visualMesh.material;
+  mat.emissiveIntensity = Math.min(
+    5.8,
+    3.4 + 0.24 * (ent.plasmaTier - 1)
+  );
+  mat.needsUpdate = true;
+}
+
+/** Fusión bala+bala: aliado, recto, atraviesa hasta N drones. */
+function createPlasmaBolt(x, y, z, dx, dy, dz, holdInHand = false) {
+  let dist = Math.hypot(dx, dy, dz);
+  let nx;
+  let ny;
+  let nz;
+  if (dist < 1e-5) {
+    nx = 0;
+    ny = 0;
+    nz = -1;
+    dist = 1;
+  } else {
+    nx = dx / dist;
+    ny = dy / dist;
+    nz = dz / dist;
+  }
+
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x7affee,
+    emissive: 0x00ffcc,
+    emissiveIntensity: 3.4,
+    metalness: 0.42,
+    roughness: 0.22,
+  });
+  const visualMesh = new THREE.Mesh(projGeo, mat);
+  visualMesh.scale.setScalar(PROJ_VISUAL_SCALE * 1.15);
+  visualMesh.castShadow = true;
+
+  const pickMat = new THREE.MeshBasicMaterial({
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    color: 0x000000,
+  });
+  const pickMesh = new THREE.Mesh(pickGeo, pickMat);
+
+  const group = new THREE.Group();
+  group.add(visualMesh);
+  group.add(pickMesh);
+  scene.add(group);
+
+  const shape = new CANNON.Sphere(PROJ_RADIUS);
+  const body = new CANNON.Body({
+    mass: PROJ_MASS * 0.9,
+    linearDamping: 0,
+    angularDamping: 0.25,
+    position: new CANNON.Vec3(x, y, z),
+    collisionResponse: true,
+    collisionFilterGroup: 1,
+    collisionFilterMask: COLLISION_MASK_ENEMY_PROJECTILE,
+  });
+  body.addShape(shape);
+
+  if (holdInHand) {
+    body.velocity.set(0, 0, 0);
+  } else {
+    body.velocity.set(
+      nx * PROJ_PLASMA_SPEED,
+      ny * PROJ_PLASMA_SPEED,
+      nz * PROJ_PLASMA_SPEED
+    );
+  }
+
+  const ent = {
+    group,
+    visualMesh,
+    pickMesh,
+    body,
+    state: 'friendly',
+    age: 0,
+    pathTraveled: 0,
+    dead: false,
+    plasmaDir: { x: nx, y: ny, z: nz },
+    plasmaPierceLeft: PROJ_PLASMA_PIERCE_COUNT,
+    plasmaTier: 1,
+  };
+  new EnemyBullet(ent);
+
+  body.userData = { projectileEnt: ent };
+  applyPlasmaTierToBody(ent);
+
+  visualMesh.userData = {
+    body,
+    isGrabbable: true,
+    isProjectile: true,
+    projectileEnt: ent,
+  };
+  pickMesh.userData = {
+    body,
+    isGrabbable: true,
+    isProjectile: true,
+    projectileEnt: ent,
+    visualMesh,
+    isProjectilePick: true,
+  };
+  group.userData = {
+    body,
+    isProjectile: true,
+    projectileEnt: ent,
+    visualMesh,
+    pickMesh,
+  };
+
+  body.addEventListener('collide', (e) => {
+    onProjectileCollide(ent, e.body, e.contact);
   });
 
   world.addBody(body);
@@ -895,7 +1817,13 @@ function updateProjectileLife(dt) {
     const ent = enemyProjectiles[i];
     if (ent.dead) continue;
     ent.age += dt;
+    if (isBodyInMagneticFusion(ent.body)) {
+      continue;
+    }
     if (ent.shieldStuck) {
+      continue;
+    }
+    if (isBodyMagneticallyCaptured(ent.body)) {
       continue;
     }
     if (ent.shieldDropping) {
@@ -907,7 +1835,7 @@ function updateProjectileLife(dt) {
     }
     const p = ent.body.position;
     if (
-      ent.state === 'enemy' &&
+      (ent.state === 'enemy' || ent.plasmaDir || ent.friendlyFlightDir) &&
       grabbedBody !== ent.body &&
       (Math.abs(p.x) > ARENA_HALF ||
         Math.abs(p.z) > ARENA_HALF ||
@@ -918,12 +1846,17 @@ function updateProjectileLife(dt) {
       continue;
     }
     if (grabbedBody !== ent.body) {
-      const spd =
-        ent.state === 'enemy' && ent.enemyDir
-          ? PROJ_ENEMY_SPEED
-          : ent.body.velocity.length();
+      let spd;
+      if (ent.plasmaDir) spd = PROJ_PLASMA_SPEED;
+      else if (ent.state === 'enemy' && ent.enemyDir) spd = PROJ_ENEMY_SPEED;
+      else if (ent.friendlyFlightDir)
+        spd =
+          ent.friendlyFlightSpeed ??
+          LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT;
+      else spd = ent.body.velocity.length();
       ent.pathTraveled += spd * dt;
-      if (ent.pathTraveled > PROJ_MAX_PATH_TRAVEL) {
+      const maxPath = ent.plasmaDir ? PROJ_PLASMA_MAX_PATH : PROJ_MAX_PATH_TRAVEL;
+      if (ent.pathTraveled > maxPath) {
         removeProjectile(ent);
         continue;
       }
@@ -934,16 +1867,23 @@ function updateProjectileLife(dt) {
   }
 }
 
-/** Antes de integrar: quita la gravedad global del `force` (solo disparos enemigos). */
+/** Antes de integrar: quita gravedad en disparos rectos (enemigo o plasma). */
 function cancelEnemyProjectileGravity() {
   const g = world.gravity;
   const gx = g.x;
   const gy = g.y;
   const gz = g.z;
   for (const ent of enemyProjectiles) {
-    if (ent.dead || ent.state !== 'enemy' || !ent.enemyDir) continue;
+    if (ent.dead) continue;
+    if (isBodyMagneticallyCaptured(ent.body)) continue;
+    if (isBodyInMagneticFusion(ent.body)) continue;
     if (ent.shieldStuck || ent.shieldDropping) continue;
     if (grabbedBody === ent.body) continue;
+    const enemyRay = ent.state === 'enemy' && ent.enemyDir;
+    const plasmaRay = Boolean(ent.plasmaDir);
+    const friendlyRay =
+      ent.state === 'friendly' && ent.friendlyFlightDir && !ent.plasmaDir;
+    if (!enemyRay && !plasmaRay && !friendlyRay) continue;
     const b = ent.body;
     const m = b.mass;
     b.force.x -= m * gx;
@@ -952,24 +1892,70 @@ function cancelEnemyProjectileGravity() {
   }
 }
 
-/** Después del paso: velocidad constante en línea recta (sin caída ni rebote). */
+/** Después del paso: velocidad constante en línea recta (enemigo o plasma). */
 function enforceEnemyProjectileStraightFlight() {
   for (const ent of enemyProjectiles) {
-    if (ent.dead || ent.state !== 'enemy' || !ent.enemyDir) continue;
+    if (ent.dead) continue;
+    if (isBodyMagneticallyCaptured(ent.body)) continue;
+    if (isBodyInMagneticFusion(ent.body)) continue;
     if (ent.shieldStuck || ent.shieldDropping) continue;
     if (grabbedBody === ent.body) continue;
-    const d = ent.enemyDir;
-    const b = ent.body;
-    b.velocity.set(
-      d.x * PROJ_ENEMY_SPEED,
-      d.y * PROJ_ENEMY_SPEED,
-      d.z * PROJ_ENEMY_SPEED
-    );
-    b.angularVelocity.set(0, 0, 0);
+    if (ent.state === 'enemy' && ent.enemyDir) {
+      const d = ent.enemyDir;
+      const b = ent.body;
+      b.velocity.set(
+        d.x * PROJ_ENEMY_SPEED,
+        d.y * PROJ_ENEMY_SPEED,
+        d.z * PROJ_ENEMY_SPEED
+      );
+      b.angularVelocity.set(0, 0, 0);
+      continue;
+    }
+    if (ent.plasmaDir) {
+      const d = ent.plasmaDir;
+      const b = ent.body;
+      b.velocity.set(
+        d.x * PROJ_PLASMA_SPEED,
+        d.y * PROJ_PLASMA_SPEED,
+        d.z * PROJ_PLASMA_SPEED
+      );
+      b.angularVelocity.set(0, 0, 0);
+      continue;
+    }
+    if (ent.state === 'friendly' && ent.friendlyFlightDir && !ent.plasmaDir) {
+      const d = ent.friendlyFlightDir;
+      const sp =
+        ent.friendlyFlightSpeed ??
+        LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT;
+      const b = ent.body;
+      b.velocity.set(d.x * sp, d.y * sp, d.z * sp);
+      b.angularVelocity.set(0, 0, 0);
+    }
+  }
+}
+
+function cancelMagneticCaptureGravity() {
+  const g = world.gravity;
+  const gx = g.x;
+  const gy = g.y;
+  const gz = g.z;
+  const sub = (b) => {
+    const m = b.mass;
+    b.force.x -= m * gx;
+    b.force.y -= m * gy;
+    b.force.z -= m * gz;
+  };
+  for (const c of capturedObjects) {
+    sub(c.body);
+  }
+  if (fusionState) {
+    sub(fusionState.entryA.body);
+    sub(fusionState.entryB.body);
   }
 }
 
 world.addEventListener('preStep', cancelEnemyProjectileGravity);
+world.addEventListener('preStep', cancelMagneticCaptureGravity);
 world.addEventListener('postStep', enforceEnemyProjectileStraightFlight);
 
 function computeShieldFrame() {
@@ -1005,6 +1991,8 @@ function updateShieldStuckProjectiles() {
   for (const ent of enemyProjectiles) {
     if (ent.dead || ent.state !== 'enemy' || grabbedBody === ent.body) continue;
     if (ent.shieldStuck || ent.shieldDropping) continue;
+    if (isBodyInMagneticFusion(ent.body)) continue;
+    if (isBodyMagneticallyCaptured(ent.body)) continue;
 
     const p = ent.body.position;
     const v = ent.body.velocity;
@@ -1042,6 +2030,7 @@ function updateShieldStuckProjectiles() {
     ent.shieldStuck = true;
     ent.shieldStickU = su;
     ent.shieldStickV = sv;
+    removeMagneticCaptureForBody(ent.body);
   }
 
   for (const ent of enemyProjectiles) {
@@ -1076,7 +2065,12 @@ function updateBulletTimeAndPhysicsScale() {
   }
   let near = false;
   for (const ent of enemyProjectiles) {
-    if (ent.dead || ent.state !== 'enemy') continue;
+    if (
+      ent.dead ||
+      (ent.state !== 'enemy' && !ent.plasmaDir && !ent.friendlyFlightDir)
+    ) {
+      continue;
+    }
     const p = ent.body.position;
     _tmpBulletNear.set(p.x, p.y, p.z);
     if (
@@ -1093,7 +2087,11 @@ function updateBulletTimeAndPhysicsScale() {
     for (const h of hits) {
       if (h.distance >= BULLET_TIME_NEAR_DIST) continue;
       const pe = h.object.userData?.projectileEnt;
-      if (pe && !pe.dead && pe.state === 'enemy') {
+      if (
+        pe &&
+        !pe.dead &&
+        (pe.state === 'enemy' || pe.plasmaDir || pe.friendlyFlightDir)
+      ) {
         near = true;
         break;
       }
@@ -1112,6 +2110,9 @@ let shieldPressed = false;
 const GRAB_GLOW_COLOR = 0x9966ff;
 const GRAB_GLOW_INTENSITY = 0.55;
 const GRAB_CUBE_OPACITY = 0.32;
+/** Telaraña / plasma agarrado: ver la mira a través del proyectil. */
+const GRAB_PROJECTILE_VORTEX_OPACITY = 0.36;
+const GRAB_PLASMA_HELD_OPACITY = 0.48;
 
 function getLookedAtGrabbableMesh() {
   raycaster.setFromCamera(ndcCenter, camera);
@@ -1173,7 +2174,7 @@ function updateGrabGlow(aimMesh) {
   }
 }
 
-function applyGrabTransparency(mesh) {
+function applyGrabTransparency(mesh, opacity = GRAB_CUBE_OPACITY) {
   const mat = mesh.material;
   if (!mesh.userData.grabMatSave) {
     mesh.userData.grabMatSave = {
@@ -1185,7 +2186,7 @@ function applyGrabTransparency(mesh) {
     };
   }
   mat.transparent = true;
-  mat.opacity = GRAB_CUBE_OPACITY;
+  mat.opacity = opacity;
   mat.depthWrite = false;
   mat.needsUpdate = true;
 }
@@ -1201,6 +2202,15 @@ function clearGrabTransparency(mesh) {
   mat.emissiveIntensity = s.emissiveIntensity;
   mat.needsUpdate = true;
   delete mesh.userData.grabMatSave;
+}
+
+function clearVortexTransparencyIfNotGrabbed(entry) {
+  if (!entry || grabbedBody === entry.body) return;
+  if (entry.kind === 'cube' && entry.mesh) {
+    clearGrabTransparency(entry.mesh);
+  } else if (entry.projectileEnt?.visualMesh) {
+    clearGrabTransparency(entry.projectileEnt.visualMesh);
+  }
 }
 
 window.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -1237,6 +2247,8 @@ window.addEventListener('mousedown', (e) => {
         }
       }
       physicsTimeScale = 1;
+      delete peGrab.friendlyFlightDir;
+      delete peGrab.friendlyFlightSpeed;
     }
     clearGrabGlow();
     const mesh = meshFromBody(body);
@@ -1268,6 +2280,16 @@ window.addEventListener('mouseup', (e) => {
     const pe = grabbedBody.userData?.projectileEnt;
     if (pe) {
       pe.pathTraveled = 0;
+      pe.vortexImmuneUntil = performance.now() + VORTEX_LAUNCH_IMMUNE_MS;
+      if (pe.plasmaDir) {
+        pe.plasmaDir = { x: dir.x, y: dir.y, z: dir.z };
+      }
+    } else {
+      const launchedMesh = meshFromBody(grabbedBody);
+      if (launchedMesh?.userData) {
+        launchedMesh.userData.vortexImmuneUntil =
+          performance.now() + VORTEX_LAUNCH_IMMUNE_MS;
+      }
     }
     const launchSpeed = pe
       ? LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT
@@ -1277,6 +2299,10 @@ window.addEventListener('mouseup', (e) => {
       dir.y * launchSpeed,
       dir.z * launchSpeed
     );
+    if (pe && pe.state === 'friendly' && !pe.plasmaDir) {
+      pe.friendlyFlightDir = { x: dir.x, y: dir.y, z: dir.z };
+      pe.friendlyFlightSpeed = launchSpeed;
+    }
     grabbedBody.angularVelocity.set(
       (Math.random() - 0.5) * 4,
       (Math.random() - 0.5) * 4,
@@ -1297,6 +2323,21 @@ const keys = {
 };
 
 window.addEventListener('keydown', (e) => {
+  if (e.code === 'Tab' && controls.isLocked && !isPaused) {
+    e.preventDefault();
+    if (capturedObjects.length > 2) {
+      const nPairs = getFusionPairCount(capturedObjects.length);
+      if (nPairs > 0) {
+        fusionPairCursor = (fusionPairCursor + 1) % nPairs;
+      }
+    }
+    return;
+  }
+  if (e.code === 'KeyM' && !e.repeat && controls.isLocked && !isPaused) {
+    e.preventDefault();
+    tryStartMagneticFusion();
+    return;
+  }
   if (e.code === 'KeyP' && !e.repeat) {
     isPaused = !isPaused;
     if (pauseOverlayEl) {
@@ -1305,6 +2346,8 @@ window.addEventListener('keydown', (e) => {
     }
     if (isPaused) {
       shieldPressed = false;
+      abortMagneticFusionKeepBodies();
+      releaseAllMagneticCapture();
       releaseShieldStuckProjectiles();
       keys.KeyW = false;
       keys.KeyA = false;
@@ -1446,10 +2489,17 @@ function animate() {
     updateProjectileLife(dt);
     syncPlayerHitBody();
 
+    updateMagneticFusion(dt);
     world.fixedStep((1 / 60) * physicsTimeScale, 8);
     syncMeshesFromPhysics();
     syncDroneMeshes();
     syncProjectileMeshes();
+    updateMagneticFusion(dt);
+    syncMeshesFromPhysics();
+    syncProjectileMeshes();
+    updateMagneticVortex(dt);
+    applyMagneticWebVisualJitter(performance.now());
+    updateMagneticFusionLine();
     updateShieldStuckProjectiles();
     updateDronesDeath(dt);
   }
