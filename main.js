@@ -86,9 +86,12 @@ const MEGA_CUBE_MASS = 6;
 const MEGA_CUBE_COLOR = 0x6a7a9e;
 /** Telaraña: vibración visual y resaltado del par (Tab). */
 const VORTEX_JITTER_AMP = 0.024;
-const FUSION_PREVIEW_GLOW = 0xffdd44;
-const FUSION_PREVIEW_INTENSITY_CUBE = 1.05;
-const FUSION_PREVIEW_INTENSITY_PROJ = 2.35;
+/** Rosa: objetos del par que vas a fusionar (preview + animación M). */
+const FUSION_PREVIEW_GLOW = 0xff4da6;
+const FUSION_PREVIEW_TINT = 0xffb8e0;
+const FUSION_LINE_COLOR = 0xff66c4;
+const FUSION_PREVIEW_INTENSITY_CUBE = 1.25;
+const FUSION_PREVIEW_INTENSITY_PROJ = 2.65;
 /** Rebote de balas aliadas contra el suelo (antes se borraban al instante). */
 const FRIENDLY_GROUND_RESTITUTION = 0.7;
 const FRIENDLY_GROUND_BOUNCE_MIN_SPEED = 2.6;
@@ -105,6 +108,8 @@ const VORTEX_ORBIT_R = 0.48;
 const FUSION_SPEED = 32;
 /** Distancia entre centros para completar fusión (subir si falla cubo↔bala). */
 const FUSION_MERGE_DIST = 0.38;
+/** Evita spawnear el cubo de fusión con el centro bajo el suelo (penetración → caída/explosión rara). */
+const FUSION_SPAWN_GROUND_CLEARANCE = 0.07;
 /** Tras lanzar con RMB, no volver a atrapar en el vórtice (evita anular el disparo). */
 const VORTEX_LAUNCH_IMMUNE_MS = 1200;
 /** Máximo de cuerpos en la telaraña magnética (cubos + proyectiles). */
@@ -519,7 +524,7 @@ fusionLineGeo.setAttribute(
 );
 const fusionLine = new THREE.Line(
   fusionLineGeo,
-  new THREE.LineBasicMaterial({ color: 0xffdd22 })
+  new THREE.LineBasicMaterial({ color: FUSION_LINE_COLOR })
 );
 fusionLine.visible = false;
 fusionLine.frustumCulled = false;
@@ -573,11 +578,16 @@ function getFusionMatFromCaptureEntry(entry) {
 
 function pushFusionGlow(stack, mat, emissiveIntensity) {
   if (!mat?.emissive) return;
-  stack.push({
+  const entry = {
     mat,
     emissive: mat.emissive.clone(),
     emissiveIntensity: mat.emissiveIntensity,
-  });
+  };
+  if (mat.color) {
+    entry.color = mat.color.clone();
+    mat.color.setHex(FUSION_PREVIEW_TINT);
+  }
+  stack.push(entry);
   mat.emissive.setHex(FUSION_PREVIEW_GLOW);
   mat.emissiveIntensity = emissiveIntensity;
   mat.needsUpdate = true;
@@ -588,6 +598,7 @@ function popFusionGlowStack(stack) {
     if (!s.mat?.emissive) continue;
     s.mat.emissive.copy(s.emissive);
     s.mat.emissiveIntensity = s.emissiveIntensity;
+    if (s.color && s.mat.color) s.mat.color.copy(s.color);
     s.mat.needsUpdate = true;
   }
   stack.length = 0;
@@ -599,6 +610,11 @@ function clearFusionPreviewGlow() {
 
 function clearFusionActiveGlow() {
   popFusionGlowStack(fusionActiveGlowStack);
+}
+
+function clampFusionSpawnY(y, physicsHalfExtentY) {
+  const minCenterY = physicsHalfExtentY + FUSION_SPAWN_GROUND_CLEARANCE;
+  return Math.max(y, minCenterY);
 }
 
 function getMagneticFusionRecipe(entryA, entryB) {
@@ -912,9 +928,9 @@ function completeMagneticFusion(entryA, entryB) {
 
   let mesh;
   if (recipe === 'mega') {
-    mesh = addMegaBlock(x, y, z);
+    mesh = addMegaBlock(x, clampFusionSpawnY(y, MEGA_CUBE_HALF), z);
   } else {
-    mesh = addExplosiveCube(x, y, z);
+    mesh = addExplosiveCube(x, clampFusionSpawnY(y, 0.5), z);
   }
   const body = mesh.userData.body;
   body.velocity.set(0, 0, 0);
@@ -2108,8 +2124,13 @@ let grabGlowMesh = null;
 /** Clic izquierdo mantenido: escudo magnético + gesto de mano. */
 let shieldPressed = false;
 
-const GRAB_GLOW_COLOR = 0x9966ff;
-const GRAB_GLOW_INTENSITY = 0.55;
+/** Celeste unificado: mira sobre algo agarrable (antes de clic). */
+const GRAB_GLOW_COLOR = 0x5adfff;
+const GRAB_GLOW_INTENSITY = 0.62;
+/** Celeste unificado: vórtice / objeto transparente listo para lanzar. */
+const GRAB_HELD_COLOR = 0x8ee7ff;
+const GRAB_HELD_EMISSIVE = 0x3ec8f0;
+const GRAB_HELD_EMISSIVE_INTENSITY = 1.05;
 const GRAB_CUBE_OPACITY = 0.32;
 /** Telaraña / plasma agarrado: ver la mira a través del proyectil. */
 const GRAB_PROJECTILE_VORTEX_OPACITY = 0.36;
@@ -2182,10 +2203,14 @@ function applyGrabTransparency(mesh, opacity = GRAB_CUBE_OPACITY) {
       opacity: mat.opacity,
       transparent: mat.transparent,
       depthWrite: mat.depthWrite,
+      color: mat.color.clone(),
       emissive: mat.emissive.clone(),
       emissiveIntensity: mat.emissiveIntensity,
     };
   }
+  mat.color.setHex(GRAB_HELD_COLOR);
+  mat.emissive.setHex(GRAB_HELD_EMISSIVE);
+  mat.emissiveIntensity = GRAB_HELD_EMISSIVE_INTENSITY;
   mat.transparent = true;
   mat.opacity = opacity;
   mat.depthWrite = false;
@@ -2199,6 +2224,7 @@ function clearGrabTransparency(mesh) {
   mat.opacity = s.opacity;
   mat.transparent = s.transparent;
   mat.depthWrite = s.depthWrite;
+  mat.color.copy(s.color);
   mat.emissive.copy(s.emissive);
   mat.emissiveIntensity = s.emissiveIntensity;
   mat.needsUpdate = true;
