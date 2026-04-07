@@ -25,9 +25,20 @@ const BULLET_TIME_NEAR_DIST = 5;
 const BULLET_TIME_SCALE = 0.2;
 /** Más lento = tiempo de reacción y telequinesis jugables. */
 const PROJ_ENEMY_SPEED = 19;
-const DRONE_ATTACK_MIN_DIST = 10;
-const DRONE_ATTACK_MAX_DIST = 20;
-const DRONE_FIRE_COOLDOWN = 3;
+/** Banda donde pueden disparar (m): más ancha = disparan desde más lejos. */
+const DRONE_ATTACK_MIN_DIST = 6.5;
+const DRONE_ATTACK_MAX_DIST = 34;
+/** No metralleta; más rápido que el 3 s del commit base. */
+const DRONE_FIRE_COOLDOWN = 1.65;
+/** Persiguen al jugador (comportamiento clásico en banda solo disparan). */
+const DRONE_PATTERN_CHASER = 'chaser';
+/** Rodean en órbita y disparan desde la banda. */
+const DRONE_PATTERN_STRAFE = 'strafe';
+/** Velocidad angular en órbita (rad/s). */
+const DRONE_ORBIT_ANGULAR_SPEED = 0.58;
+/** Radio de órbita en XZ (dentro de la banda de disparo). */
+const DRONE_STRAFE_RADIUS_MIN = 11;
+const DRONE_STRAFE_RADIUS_MAX = 22;
 /** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
 const PLAYER_HIT_RADIUS = 0.64;
 
@@ -646,6 +657,7 @@ const _pinShieldPos = new THREE.Vector3();
 const _worldUpY = new THREE.Vector3(0, 1, 0);
 const _vortexPt = new THREE.Vector3();
 const _vortexSlot = new THREE.Vector3();
+const _vortexLaunchDir = new THREE.Vector3();
 const _fusionMid = new THREE.Vector3();
 const _plasmaFireDir = new THREE.Vector3();
 const fusionLinePositions = new Float32Array(6);
@@ -871,6 +883,67 @@ function getVortexWorldPoint(out) {
   out.addScaledVector(_shieldNormal, VORTEX_DIST);
   out.y += -0.12;
   return out;
+}
+
+/** Clic derecho con escudo: lanza todo el vórtice hacia la mira (mismo criterio que telequinesis al soltar). */
+function launchVortexContentsAlongAim(dir) {
+  const inv = dir.length();
+  if (inv < 1e-6) return;
+  const nx = dir.x / inv;
+  const ny = dir.y / inv;
+  const nz = dir.z / inv;
+  const list = capturedObjects.slice();
+  capturedObjects.length = 0;
+  fusionPairCursor = 0;
+  fusionLine.visible = false;
+  clearFusionPreviewGlow();
+
+  const projSpeed = LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT;
+  const cubeSpeed = LAUNCH_SPEED;
+  const now = performance.now();
+
+  for (const c of list) {
+    if (!c.body || grabbedBody === c.body) continue;
+    clearVortexTransparencyIfNotGrabbed(c);
+    const b = c.body;
+    b.wakeUp();
+    if (c.kind === 'cube' && c.mesh) {
+      c.mesh.userData.vortexImmuneUntil = now + VORTEX_LAUNCH_IMMUNE_MS;
+      b.velocity.set(nx * cubeSpeed, ny * cubeSpeed, nz * cubeSpeed);
+      b.angularVelocity.set(
+        (Math.random() - 0.5) * 4,
+        (Math.random() - 0.5) * 4,
+        (Math.random() - 0.5) * 4
+      );
+    } else if (c.kind === 'projectile' && c.projectileEnt) {
+      const pe = c.projectileEnt;
+      if (pe.dead) continue;
+      pe.pathTraveled = 0;
+      pe.age = 0;
+      delete pe.bubbleMode;
+      delete pe.bubbleDir;
+      delete pe.bubbleSpeed;
+      pe.vortexImmuneUntil = now + VORTEX_LAUNCH_IMMUNE_MS;
+      if (pe.plasmaDir) {
+        pe.plasmaDir = { x: nx, y: ny, z: nz };
+        b.velocity.set(
+          nx * PROJ_PLASMA_SPEED,
+          ny * PROJ_PLASMA_SPEED,
+          nz * PROJ_PLASMA_SPEED
+        );
+      } else {
+        if (pe.state === 'enemy') captureProjectileVisual(pe);
+        pe.friendlyFlightDir = { x: nx, y: ny, z: nz };
+        pe.friendlyFlightSpeed = projSpeed;
+        b.velocity.set(nx * projSpeed, ny * projSpeed, nz * projSpeed);
+      }
+      b.angularVelocity.set(
+        (Math.random() - 0.5) * 4,
+        (Math.random() - 0.5) * 4,
+        (Math.random() - 0.5) * 4
+      );
+    }
+  }
 }
 
 function removeCubeMesh(mesh) {
@@ -1467,6 +1540,10 @@ function createDrone(x, y, z, opts = {}) {
   body.addShape(shape);
   world.addBody(body);
 
+  const roll = Math.random();
+  const aiPattern =
+    opts.aiPattern ??
+    (roll < 0.5 ? DRONE_PATTERN_CHASER : DRONE_PATTERN_STRAFE);
   const drone = {
     mesh,
     body,
@@ -1475,6 +1552,12 @@ function createDrone(x, y, z, opts = {}) {
     deathPhase: 0,
     personalOffset: randomPersonalOffset(),
     shootTimer: 0,
+    aiPattern,
+    orbitAngle: Math.random() * Math.PI * 2,
+    orbitDir: Math.random() < 0.5 ? 1 : -1,
+    orbitRadius:
+      DRONE_STRAFE_RADIUS_MIN +
+      Math.random() * (DRONE_STRAFE_RADIUS_MAX - DRONE_STRAFE_RADIUS_MIN),
   };
 
   body.addEventListener('collide', (e) => {
@@ -1527,16 +1610,19 @@ function killDrone(drone, opts = {}) {
 
 const _droneToPlayer = new CANNON.Vec3();
 const _droneForce = new CANNON.Vec3();
+const _droneRadialXZ = new THREE.Vector3();
 
 function updateDronesAI(dt) {
+  const px = playerTarget.position.x;
+  const py = playerTarget.position.y;
+  const pz = playerTarget.position.z;
+
   for (const d of drones) {
     if (d.dying) continue;
     const b = d.body;
-    _droneToPlayer.set(
-      playerTarget.position.x - b.position.x,
-      playerTarget.position.y - b.position.y,
-      playerTarget.position.z - b.position.z
-    );
+    const pattern = d.aiPattern || DRONE_PATTERN_CHASER;
+
+    _droneToPlayer.set(px - b.position.x, py - b.position.y, pz - b.position.z);
     const distToCam = _droneToPlayer.length();
     const inAttackBand =
       distToCam >= DRONE_ATTACK_MIN_DIST && distToCam <= DRONE_ATTACK_MAX_DIST;
@@ -1556,17 +1642,44 @@ function updateDronesAI(dt) {
           playerTarget.position.z
         );
       }
-      continue;
+      if (pattern === DRONE_PATTERN_CHASER) {
+        continue;
+      }
+    } else {
+      d.shootTimer = 0;
     }
-
-    d.shootTimer = 0;
 
     const ox = d.personalOffset.x;
     const oy = d.personalOffset.y;
     const oz = d.personalOffset.z;
-    const tx = camera.position.x + ox;
-    const ty = camera.position.y + oy;
-    const tz = camera.position.z + oz;
+
+    let tx;
+    let ty;
+    let tz;
+    if (pattern === DRONE_PATTERN_STRAFE) {
+      d.orbitAngle =
+        (d.orbitAngle ?? 0) +
+        dt * DRONE_ORBIT_ANGULAR_SPEED * (d.orbitDir ?? 1);
+      const r = d.orbitRadius ?? 15;
+      const oxs = ox * 0.35;
+      const ozs = oz * 0.35;
+      tx = px + Math.cos(d.orbitAngle) * r + oxs;
+      ty = py + oy * 0.45;
+      tz = pz + Math.sin(d.orbitAngle) * r + ozs;
+    } else {
+      tx = camera.position.x + ox;
+      ty = camera.position.y + oy;
+      tz = camera.position.z + oz;
+      _droneRadialXZ.set(b.position.x - px, 0, b.position.z - pz);
+      const rh = _droneRadialXZ.length();
+      if (rh > 0.08 && distToCam < DRONE_ATTACK_MIN_DIST) {
+        _droneRadialXZ.multiplyScalar(1 / rh);
+        const ringR = DRONE_ATTACK_MIN_DIST + 2;
+        tx = px + _droneRadialXZ.x * ringR;
+        tz = pz + _droneRadialXZ.z * ringR;
+      }
+    }
+
     _droneToPlayer.set(tx - b.position.x, ty - b.position.y, tz - b.position.z);
     const dist = _droneToPlayer.length();
     if (dist < 0.15) continue;
@@ -2797,6 +2910,15 @@ window.addEventListener('mousedown', (e) => {
     return;
   }
   if (isPaused || e.button !== 2 || !controls.isLocked) return;
+  if (shieldPressed && capturedObjects.length > 0) {
+    physicsTimeScale = 1;
+    camera.getWorldDirection(_vortexLaunchDir);
+    launchVortexContentsAlongAim(_vortexLaunchDir);
+    handExtendedUntil = performance.now() + HAND_EXTENDED_MS;
+    handShakeX += (Math.random() - 0.5) * 8;
+    handShakeY += HAND_KICK_Y * 0.5;
+    return;
+  }
   const body = getLookedAtGrabbableBody();
   if (body) {
     const peGrab = body.userData?.projectileEnt;
