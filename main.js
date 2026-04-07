@@ -4,182 +4,123 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import * as CANNON from 'cannon-es';
-
-/** Altura de los ojos respecto al suelo (m). ~1,74 ≈ persona ~1,80 m; más alto que antes para apuntar abajo sin “clavar” en el plano. */
-const PLAYER_EYE_HEIGHT = 1.74;
-const MOVE_SPEED = 12;
-/** Alcance máximo del rayo de telequinesis (más pequeño = “escudo” más ajustado). */
-const GRAB_REACH = 18;
-const PULL_GAIN = 10;
-const PULL_MAX_SPEED = 28;
-const LAUNCH_SPEED = 42;
-const LAUNCH_PROJECTILE_MULT = 1.5;
-
-const PROJ_RADIUS = 0.22;
-const PROJ_MASS = 0.16;
-/** Radio solo visual (balas más visibles para apuntar/agarrar). */
-const PROJ_VISUAL_SCALE = 2;
-/** Esfera invisible grande solo para el raycaster (más fácil “pescar”). */
-const PROJ_PICK_RADIUS = 0.58;
-const BULLET_TIME_NEAR_DIST = 5;
-const BULLET_TIME_SCALE = 0.2;
-/** Más lento = tiempo de reacción y telequinesis jugables. */
-const PROJ_ENEMY_SPEED = 19;
-/** Banda donde pueden disparar (m): más ancha = disparan desde más lejos. */
-const DRONE_ATTACK_MIN_DIST = 6.5;
-const DRONE_ATTACK_MAX_DIST = 34;
-/** No metralleta; más rápido que el 3 s del commit base. */
-const DRONE_FIRE_COOLDOWN = 1.65;
-/** Persiguen al jugador (comportamiento clásico en banda solo disparan). */
-const DRONE_PATTERN_CHASER = 'chaser';
-/** Rodean en órbita y disparan desde la banda. */
-const DRONE_PATTERN_STRAFE = 'strafe';
-/** Velocidad angular en órbita (rad/s). */
-const DRONE_ORBIT_ANGULAR_SPEED = 1.02;
-/** Radio de órbita en XZ (dentro de la banda de disparo). */
-const DRONE_STRAFE_RADIUS_MIN = 11;
-const DRONE_STRAFE_RADIUS_MAX = 22;
-/** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
-const PLAYER_HIT_RADIUS = 0.64;
-
-const DRONE_RADIUS = 0.38;
-const DRONE_MASS = 0.55;
-/** Evita spawnear la bala dentro del cuerpo del dron (solapamiento = empuje aleatorio del solver). */
-const PROJ_SPAWN_CLEARANCE = DRONE_RADIUS + PROJ_RADIUS + 0.1;
-/** Velocidad máxima de desplazamiento (unidades/s). */
-const DRONE_MAX_SPEED = 8.6;
-/** Qué tan rápido alcanzan esa velocidad (steering). */
-const DRONE_STEER_STRENGTH = 6.2;
-/** Tope de fuerza por frame para evitar tirones. */
-const DRONE_MAX_FORCE = 20;
-/** Amortiguación lineal del cuerpo (menos = más ágiles). */
-const DRONE_LINEAR_DAMPING = 0.28;
-const SPAWN_INTERVAL = 5;
-/** Anillo de aparición alrededor del jugador: radio interior / exterior. */
-const SPAWN_RING_INNER = 22;
-const SPAWN_RING_OUTER = 36;
-/** Cada dron persigue un punto cerca del jugador, no el mismo centro (evita amontonarse). */
-const DRONE_PERSONAL_OFFSET_RANGE = 2.2;
-const CUBE_KILL_DRONE_SPEED = 16;
-const DRONE_DEATH_SHRINK_SPEED = 7;
-const DRONE_FLASH_SEC = 0.12;
-const MAX_DRONES = 36;
-/** Enemigo élite: más grande, escudo morado; solo muere por explosión de combinación. */
-const ELITE_DRONE_RADIUS = 0.62;
-const ELITE_DRONE_MASS = 1.05;
-/** Cada N enemigos normales derrotados aparece un élite. */
-const ELITE_SPAWN_EVERY_NORMAL_KILLS = 10;
-
-/** --- Prueba: `true` = no spawn de drones; `TEST_MODE_DUAL_MG` = dos ametralladoras fijas. */
-const TEST_MODE_NO_DRONES = false;
-const TEST_MODE_DUAL_MG = false;
-const TEST_MG_FIRE_INTERVAL = 3;
-const TEST_MG_A = Object.freeze({ x: -20, y: 1.6, z: -35 });
-const TEST_MG_B = Object.freeze({ x: 24, y: 1.8, z: 30 });
-
-const HAND_SIZE_PX = 292;
-/** Mano derecha (telequinesis): fracción del ancho a la derecha del centro. */
-const HAND_RIGHT_ANCHOR_X_FRAC = 0.1;
-/** Mano izquierda (escudo): espejo de la textura de la derecha, simétrica en X. */
-const HAND_LEFT_ANCHOR_X_FRAC = -0.1;
-/** Fracción del alto: negativo = por debajo del centro. */
-const HAND_ANCHOR_Y_FRAC = -0.4;
-const HAND_EXTENDED_MS = 200;
-const HAND_KICK_X = 14;
-const HAND_KICK_Y = 18;
-
-/** Distancia recorrida máxima por proyectil enemigo (trayectoria recta). */
-const PROJ_MAX_PATH_TRAVEL = 120;
-/** Telequinesis / lanzamiento aliado (sin plasma): debe alcanzar paredes lejanas del arena. */
-const PROJ_FRIENDLY_STRAIGHT_MAX_PATH = 520;
-/** Segundos máximos de vida (respaldo). */
-const PROJ_MAX_LIFE = 40;
-/** Modo burbuja (rebotes): sin tope de distancia; solo edad y escape del mapa. */
-const PROJ_BUBBLE_MAX_LIFE = 120;
-/** Disparos rectos: cuánta gravedad del mundo se “anula” (0 = caen normal; 1 = vuelo horizontal como antes). */
-const PROJ_GRAVITY_CANCEL_STRAIGHT = 0.52;
-/** Mezcla velocidad Y física tras integrar (cae un poco aunque apuntes recto). */
-const PROJ_GRAVITY_BLEND_Y = 0.38;
-/** Fusión bala+bala → rayo plasma (aliado, atraviesa drones). */
-const PROJ_PLASMA_SPEED = 64;
-const PROJ_PLASMA_MAX_PATH = 240;
-const PROJ_PLASMA_PIERCE_COUNT = 16;
-/** Cada fusión bala+bala sobre el plasma ya agarrado: más grande y más penetraciones. */
-const PLASMA_MAX_TIER = 14;
-const PLASMA_RADIUS_GROWTH = 1.082;
-const PLASMA_PIERCE_PER_STACK = 5;
-const PLASMA_VISUAL_GROW_PER_TIER = 0.1;
-const PLASMA_PICK_SCALE_PER_TIER = 0.085;
-/** Cubo+bala → explosión al impacto fuerte / suelo / dron. */
-const EXPLOSIVE_CUBE_BLAST_RADIUS = 5.2;
-const EXPLOSIVE_ARM_DELAY_MS = 380;
-const EXPLOSIVE_DETONATE_SPEED = 2.0;
-/** Cubo+cubo → mega bloque (2 m de lado). */
-const MEGA_CUBE_HALF = 1;
-const MEGA_CUBE_MASS = 6;
-const MEGA_CUBE_COLOR = 0x6a7a9e;
-/** Telaraña: vibración visual y resaltado del par (Tab). */
-const VORTEX_JITTER_AMP = 0.024;
-/** Rosa: objetos del par que vas a fusionar (preview + animación M). */
-const FUSION_PREVIEW_GLOW = 0xff4da6;
-const FUSION_PREVIEW_TINT = 0xffb8e0;
-const FUSION_LINE_COLOR = 0xff66c4;
-const FUSION_PREVIEW_INTENSITY_CUBE = 1.25;
-const FUSION_PREVIEW_INTENSITY_PROJ = 2.65;
-/** Mismo límite horizontal que el jugador (cámara clamp ±ARENA_HALF). Fuera → se elimina el disparo enemigo. */
-const ARENA_HALF = 58;
-const ARENA_Y_MIN = -2;
-const ARENA_Y_MAX = 80;
-/** Límites físicos del arena (paredes; más gruesas = menos tunelado a alta velocidad). */
-const ARENA_WALL_HALF_THICK = 1.25;
-const ARENA_WALL_HEIGHT = 46;
-/** Pelotas tipo ping-pong: rápidas, más elásticas; siguen hasta pegar dron. */
-const BUBBLE_WALL_RESTITUTION = 0.82;
-const BUBBLE_GROUND_RESTITUTION = 0.76;
-const BUBBLE_SPEED_RETENTION = 0.78;
-const BUBBLE_MAX_SPEED = 40;
-const BUBBLE_MIN_SPEED = 20;
-/** Impulso aleatorio suave (rompe rebotes perfectos hacia la misma línea). */
-const BUBBLE_RANDOM_IMPULSE = 1.35;
-/** Explosión de combinación: barrido esférico invisible (radio 0→max) en 0,5 s; partículas amarillas. */
-const FUSION_EXPLOSION_TRIGGER_DURATION = 0.5;
-const FUSION_EXPLOSION_TRIGGER_MAX_RADIUS = 5;
-const FUSION_EXPLOSION_PARTICLE_COUNT = 80;
-const FUSION_EXPLOSION_PARTICLE_LIFE = 1;
-const FUSION_EXPLOSION_LIGHT_DURATION = 0.45;
-const FUSION_EXPLOSION_SHAKE_BASE = 0.2;
-const FUSION_IMPACT_MIN_SPEED_CUBE = 10;
-
-/** Combinación magnética (escudo + vórtice). */
-const VORTEX_RADIUS = 3;
-const VORTEX_DIST = 2.05;
-const VORTEX_LERP = 7;
-const VORTEX_ORBIT_R = 0.48;
-const FUSION_SPEED = 32;
-/** Distancia entre centros para completar fusión (subir si falla cubo↔bala). */
-const FUSION_MERGE_DIST = 0.38;
-/** Evita spawnear el cubo de fusión con el centro bajo el suelo (penetración → caída/explosión rara). */
-const FUSION_SPAWN_GROUND_CLEARANCE = 0.07;
-/** Tras lanzar con RMB, no volver a atrapar en el vórtice (evita anular el disparo). */
-const VORTEX_LAUNCH_IMMUNE_MS = 1200;
-/** Máximo de cuerpos en la telaraña magnética (cubos + proyectiles). */
-const VORTEX_MAX_CAPTURED = 5;
+import {
+  ARENA_HALF,
+  ARENA_WALL_HALF_THICK,
+  ARENA_WALL_HEIGHT,
+  ARENA_Y_MAX,
+  ARENA_Y_MIN,
+  BUBBLE_GROUND_RESTITUTION,
+  BUBBLE_MAX_SPEED,
+  BUBBLE_MIN_SPEED,
+  BUBBLE_RANDOM_IMPULSE,
+  BUBBLE_SPEED_RETENTION,
+  BUBBLE_WALL_RESTITUTION,
+  BULLET_TIME_NEAR_DIST,
+  BULLET_TIME_SCALE,
+  COLLISION_GROUP_ENEMY_PROJECTILE,
+  COLLISION_GROUP_FUSION_A,
+  COLLISION_GROUP_FUSION_B,
+  COLLISION_GROUP_PLAYER_BODY,
+  COLLISION_MASK_ENEMY_PROJECTILE,
+  CUBE_KILL_DRONE_SPEED,
+  DRONE_ATTACK_MAX_DIST,
+  DRONE_ATTACK_MIN_DIST,
+  DRONE_DEATH_SHRINK_SPEED,
+  DRONE_FIRE_COOLDOWN,
+  DRONE_FLASH_SEC,
+  DRONE_LINEAR_DAMPING,
+  DRONE_MAX_FORCE,
+  DRONE_MAX_SPEED,
+  DRONE_MASS,
+  DRONE_ORBIT_ANGULAR_SPEED,
+  DRONE_PATTERN_CHASER,
+  DRONE_PATTERN_STRAFE,
+  DRONE_PERSONAL_OFFSET_RANGE,
+  DRONE_RADIUS,
+  DRONE_STEER_STRENGTH,
+  DRONE_STRAFE_RADIUS_MAX,
+  DRONE_STRAFE_RADIUS_MIN,
+  ELITE_DRONE_MASS,
+  ELITE_DRONE_RADIUS,
+  ELITE_SPAWN_EVERY_NORMAL_KILLS,
+  EXPLOSIVE_ARM_DELAY_MS,
+  EXPLOSIVE_CUBE_BLAST_RADIUS,
+  EXPLOSIVE_DETONATE_SPEED,
+  FUSION_EXPLOSION_LIGHT_DURATION,
+  FUSION_EXPLOSION_PARTICLE_COUNT,
+  FUSION_EXPLOSION_PARTICLE_LIFE,
+  FUSION_EXPLOSION_SHAKE_BASE,
+  FUSION_EXPLOSION_TRIGGER_DURATION,
+  FUSION_EXPLOSION_TRIGGER_MAX_RADIUS,
+  FUSION_IMPACT_MIN_SPEED_CUBE,
+  FUSION_LINE_COLOR,
+  FUSION_MERGE_DIST,
+  FUSION_PREVIEW_GLOW,
+  FUSION_PREVIEW_INTENSITY_CUBE,
+  FUSION_PREVIEW_INTENSITY_PROJ,
+  FUSION_PREVIEW_TINT,
+  FUSION_SPEED,
+  FUSION_SPAWN_GROUND_CLEARANCE,
+  GRAB_REACH,
+  HAND_ANCHOR_Y_FRAC,
+  HAND_EXTENDED_MS,
+  HAND_KICK_X,
+  HAND_KICK_Y,
+  HAND_LEFT_ANCHOR_X_FRAC,
+  HAND_RIGHT_ANCHOR_X_FRAC,
+  HAND_SIZE_PX,
+  LAUNCH_PROJECTILE_MULT,
+  LAUNCH_SPEED,
+  MAX_DRONES,
+  MEGA_CUBE_COLOR,
+  MEGA_CUBE_HALF,
+  MEGA_CUBE_MASS,
+  MOVE_SPEED,
+  PLASMA_MAX_TIER,
+  PLASMA_PICK_SCALE_PER_TIER,
+  PLASMA_PIERCE_PER_STACK,
+  PLASMA_RADIUS_GROWTH,
+  PLASMA_VISUAL_GROW_PER_TIER,
+  PLAYER_EYE_HEIGHT,
+  PLAYER_HIT_RADIUS,
+  PROJ_BUBBLE_MAX_LIFE,
+  PROJ_ENEMY_SPEED,
+  PROJ_FRIENDLY_STRAIGHT_MAX_PATH,
+  PROJ_GRAVITY_BLEND_Y,
+  PROJ_GRAVITY_CANCEL_STRAIGHT,
+  PROJ_MASS,
+  PROJ_MAX_LIFE,
+  PROJ_MAX_PATH_TRAVEL,
+  PROJ_PICK_RADIUS,
+  PROJ_PLASMA_MAX_PATH,
+  PROJ_PLASMA_PIERCE_COUNT,
+  PROJ_PLASMA_SPEED,
+  PROJ_RADIUS,
+  PROJ_SPAWN_CLEARANCE,
+  PROJ_VISUAL_SCALE,
+  PULL_GAIN,
+  PULL_MAX_SPEED,
+  SPAWN_INTERVAL,
+  SPAWN_RING_INNER,
+  SPAWN_RING_OUTER,
+  TEST_MG_A,
+  TEST_MG_B,
+  TEST_MG_FIRE_INTERVAL,
+  TEST_MODE_DUAL_MG,
+  TEST_MODE_NO_DRONES,
+  VORTEX_DIST,
+  VORTEX_JITTER_AMP,
+  VORTEX_LAUNCH_IMMUNE_MS,
+  VORTEX_LERP,
+  VORTEX_MAX_CAPTURED,
+  VORTEX_ORBIT_R,
+  VORTEX_RADIUS,
+} from './src/config/constants.js';
 
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -28, 0) });
 world.allowSleep = true;
 world.broadphase = new CANNON.SAPBroadphase(world);
-
-/** Proyectiles enemigos: grupo propio para no chocar entre sí. */
-const COLLISION_GROUP_ENEMY_PROJECTILE = 2;
-const COLLISION_MASK_ENEMY_PROJECTILE = -1 ^ COLLISION_GROUP_ENEMY_PROJECTILE;
-/** Hitbox del jugador: los proyectiles en telaraña dejan de colisionar con este grupo. */
-const COLLISION_GROUP_PLAYER_BODY = 256;
-/**
- * Pareja en fusión magnética: filtros cruzados para que no colisionen entre sí
- * (el proyectil es muy ligero y el solver lo expulsaba del cubo cada frame).
- */
-const COLLISION_GROUP_FUSION_A = 32;
-const COLLISION_GROUP_FUSION_B = 64;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0c0c14);
