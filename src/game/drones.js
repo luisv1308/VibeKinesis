@@ -7,26 +7,33 @@ import {
   CUBE_KILL_DRONE_SPEED,
   DRONE_ATTACK_MAX_DIST,
   DRONE_ATTACK_MIN_DIST,
+  DRONE_ATTACKING_EMISSIVE_BOOST,
   DRONE_BURST_COUNT,
-  DRONE_BURST_RELOAD,
   DRONE_BURST_SHOT_DELAY,
   DRONE_CHASER_SPEED_MULT,
+  DRONE_CLOSE_CHASE_RADIUS,
+  DRONE_COORD_HOLD_SPEED_MULT,
   DRONE_DEATH_SHRINK_SPEED,
   DRONE_FIRE_COOLDOWN,
   DRONE_FLASH_SEC,
   DRONE_LINEAR_DAMPING,
+  DRONE_MAX_CLOSE_CHASERS,
   DRONE_MAX_SPEED,
   DRONE_MASS,
-  DRONE_ORBIT_ANGULAR_SPEED,
   DRONE_ORBIT_RADIUS_MAX,
   DRONE_ORBIT_RADIUS_MIN,
-  DRONE_ORBITER_ANGULAR_MULT,
   DRONE_ORBITER_LINEAR_DAMPING,
   DRONE_ORBITER_RADIUS_MULT,
   DRONE_PERSONAL_OFFSET_RANGE,
   DRONE_RADIUS,
+  DRONE_SEPARATION_RADIUS,
+  DRONE_SEPARATION_WEIGHT,
   DRONE_SHOOTER_FLEE_BOOST,
+  DRONE_SHOOTER_FIRE_MAX_DIST,
+  DRONE_SHOOTER_FIRE_MIN_DIST,
   DRONE_SHOOTER_IDEAL_DIST,
+  DRONE_SHOOTER_AIM_TIME,
+  DRONE_SHOOTER_PHASE_COOLDOWN,
   DRONE_SHOOTER_SPEED,
   DRONE_TYPE_CHASER,
   DRONE_TYPE_ORBITER,
@@ -63,6 +70,7 @@ export function createDronesSystem(deps) {
 
   /** @type {object[]} */
   const drones = [];
+  let nextDroneId = 1;
 
   function pickBehaviorType() {
     const r = Math.random();
@@ -121,10 +129,11 @@ export function createDronesSystem(deps) {
       emissive: 0xff0505,
       emissiveIntensity: 1.35,
     });
+    const baseEmissiveIntensity = elite ? 1.7 : 1.35;
     if (elite) {
       mat.color.setHex(0x5a4868);
       mat.emissive.setHex(0x7722ff);
-      mat.emissiveIntensity = 1.7;
+      mat.emissiveIntensity = baseEmissiveIntensity;
     } else {
       applyArcadeDroneMaterial(mat, behaviorType);
     }
@@ -155,18 +164,26 @@ export function createDronesSystem(deps) {
     body.linearFactor.set(1, 0, 1);
     world.addBody(body);
 
+    const aiState =
+      behaviorType === DRONE_TYPE_SHOOTER
+        ? 'repositioning'
+        : behaviorType === DRONE_TYPE_ORBITER
+          ? 'orbiting'
+          : 'chasing';
     const drone = {
+      id: nextDroneId++,
       mesh,
       body,
       elite,
       behaviorType,
+      aiState,
+      stateTimer: 0,
+      baseEmissiveIntensity,
       dying: false,
       deathPhase: 0,
       personalOffset: randomPersonalOffset(),
       shootTimer: 0,
       aimInAttackBand: false,
-      orbitAngle: Math.random() * Math.PI * 2,
-      orbitDir: Math.random() < 0.5 ? 1 : -1,
       orbitRadius:
         DRONE_ORBIT_RADIUS_MIN +
         Math.random() * (DRONE_ORBIT_RADIUS_MAX - DRONE_ORBIT_RADIUS_MIN),
@@ -223,6 +240,32 @@ export function createDronesSystem(deps) {
     const py = pt.y;
     const pz = pt.z;
 
+    const orbiters = [];
+    for (const d of drones) {
+      if (!d.dying && d.behaviorType === DRONE_TYPE_ORBITER) orbiters.push(d);
+    }
+    orbiters.sort((a, b) => a.id - b.id);
+    const nOrb = orbiters.length;
+    for (let i = 0; i < nOrb; i++) orbiters[i]._orbitSlot = i;
+
+    const chaserNear = [];
+    for (const d of drones) {
+      if (d.dying) continue;
+      if (d.behaviorType !== DRONE_TYPE_CHASER) continue;
+      const b = d.body;
+      const hdx = b.position.x - px;
+      const hdz = b.position.z - pz;
+      const hDist = Math.sqrt(hdx * hdx + hdz * hdz);
+      if (hDist < DRONE_CLOSE_CHASE_RADIUS) chaserNear.push({ d, hDist });
+    }
+    chaserNear.sort((a, b) => a.hDist - b.hDist);
+    const allowedClose = new Set(
+      chaserNear.slice(0, DRONE_MAX_CLOSE_CHASERS).map((x) => x.d)
+    );
+
+    const fire = (b) =>
+      createEnemyProjectile(b.position.x, b.position.y, b.position.z, px, py, pz);
+
     for (const d of drones) {
       if (d.dying) continue;
       const b = d.body;
@@ -235,42 +278,18 @@ export function createDronesSystem(deps) {
       const inAttackBand =
         distToPlayer >= DRONE_ATTACK_MIN_DIST &&
         distToPlayer <= DRONE_ATTACK_MAX_DIST;
-      d.aimInAttackBand = inAttackBand;
 
-      const fire = () =>
-        createEnemyProjectile(b.position.x, b.position.y, b.position.z, px, py, pz);
+      const inShooterFireRange =
+        distToPlayer >= DRONE_SHOOTER_FIRE_MIN_DIST &&
+        distToPlayer <= DRONE_SHOOTER_FIRE_MAX_DIST;
 
-      if (d.behaviorType === DRONE_TYPE_SHOOTER) {
-        if (inAttackBand) {
-          if (d.reloadT > 0) {
-            d.reloadT -= dt;
-          } else if (d.burstRemaining > 0) {
-            d.burstGapT -= dt;
-            if (d.burstGapT <= 0) {
-              fire();
-              d.burstRemaining -= 1;
-              if (d.burstRemaining > 0) {
-                d.burstGapT = DRONE_BURST_SHOT_DELAY;
-              } else {
-                d.reloadT = DRONE_BURST_RELOAD;
-              }
-            }
-          } else {
-            d.burstRemaining = DRONE_BURST_COUNT;
-            d.burstGapT = 0;
-          }
-        } else {
-          d.shootTimer = 0;
-          d.burstRemaining = 0;
-          d.burstGapT = 0;
-          d.reloadT = 0;
-        }
-      } else {
+      if (d.behaviorType !== DRONE_TYPE_SHOOTER) {
+        d.aimInAttackBand = inAttackBand;
         if (inAttackBand) {
           d.shootTimer += dt;
           if (d.shootTimer >= DRONE_FIRE_COOLDOWN) {
             d.shootTimer = 0;
-            fire();
+            fire(b);
           }
         } else {
           d.shootTimer = 0;
@@ -283,6 +302,50 @@ export function createDronesSystem(deps) {
       const hdz = b.position.z - pz;
       const hDist = Math.sqrt(hdx * hdx + hdz * hdz);
 
+      if (d.behaviorType === DRONE_TYPE_SHOOTER) {
+        d.aimInAttackBand = inShooterFireRange;
+
+        if (!inShooterFireRange) {
+          d.burstRemaining = 0;
+          d.burstGapT = 0;
+          d.reloadT = 0;
+          d.aiState = 'repositioning';
+          d.stateTimer = 0;
+        } else if (d.aiState === 'repositioning') {
+          const okBand =
+            hDist >= DRONE_SHOOTER_FIRE_MIN_DIST * 0.82 &&
+            hDist <= DRONE_SHOOTER_FIRE_MAX_DIST + 1.2;
+          if (okBand) {
+            d.aiState = 'aiming';
+            d.stateTimer = DRONE_SHOOTER_AIM_TIME;
+          }
+        } else if (d.aiState === 'aiming') {
+          d.stateTimer -= dt;
+          if (d.stateTimer <= 0) {
+            d.aiState = 'attacking';
+            d.burstRemaining = DRONE_BURST_COUNT;
+            d.burstGapT = 0;
+          }
+        } else if (d.aiState === 'attacking') {
+          if (d.burstRemaining > 0) {
+            d.burstGapT -= dt;
+            if (d.burstGapT <= 0) {
+              fire(b);
+              d.burstRemaining -= 1;
+              if (d.burstRemaining > 0) {
+                d.burstGapT = DRONE_BURST_SHOT_DELAY;
+              } else {
+                d.aiState = 'cooldown';
+                d.stateTimer = DRONE_SHOOTER_PHASE_COOLDOWN;
+              }
+            }
+          }
+        } else if (d.aiState === 'cooldown') {
+          d.stateTimer -= dt;
+          if (d.stateTimer <= 0) d.aiState = 'repositioning';
+        }
+      }
+
       let tx = px + ox;
       let tz = pz + oz;
       let moveSpeed = DRONE_MAX_SPEED * (d.elite ? 1.2 : 1);
@@ -292,19 +355,24 @@ export function createDronesSystem(deps) {
         : DRONE_LINEAR_DAMPING;
 
       if (bt === DRONE_TYPE_ORBITER) {
+        d.aiState = 'orbiting';
         b.linearDamping = DRONE_ORBITER_LINEAR_DAMPING;
-        d.orbitAngle +=
-          dt *
-          DRONE_ORBIT_ANGULAR_SPEED *
-          DRONE_ORBITER_ANGULAR_MULT *
-          d.orbitDir;
+        const idx = d._orbitSlot ?? 0;
+        const slotAngle = nOrb > 0 ? (idx / nOrb) * Math.PI * 2 : 0;
         const R = d.orbitRadius * DRONE_ORBITER_RADIUS_MULT;
-        tx = px + Math.cos(d.orbitAngle) * R + ox * 0.35;
-        tz = pz + Math.sin(d.orbitAngle) * R + oz * 0.35;
+        tx = px + Math.cos(slotAngle) * R + ox * 0.35;
+        tz = pz + Math.sin(slotAngle) * R + oz * 0.35;
       } else {
         b.linearDamping = baseDamp;
         if (bt === DRONE_TYPE_SHOOTER) {
-          moveSpeed = DRONE_SHOOTER_SPEED * (d.elite ? 1.1 : 1);
+          const sp = DRONE_SHOOTER_SPEED * (d.elite ? 1.1 : 1);
+          if (d.aiState === 'aiming' || d.aiState === 'attacking') {
+            moveSpeed = 0;
+          } else if (d.aiState === 'cooldown') {
+            moveSpeed = sp * 0.58;
+          } else {
+            moveSpeed = sp;
+          }
           let ideal = DRONE_SHOOTER_IDEAL_DIST;
           if (hDist > 0.08) {
             const inv = 1 / hDist;
@@ -316,8 +384,25 @@ export function createDronesSystem(deps) {
             tz = pz + hdz * inv * ideal + oz * 0.45;
           }
         } else {
+          let coordHold = false;
+          if (
+            bt === DRONE_TYPE_CHASER &&
+            hDist < DRONE_CLOSE_CHASE_RADIUS &&
+            !allowedClose.has(d)
+          ) {
+            coordHold = true;
+            d.aiState = 'holding';
+          } else if (bt === DRONE_TYPE_CHASER) {
+            d.aiState = 'chasing';
+          }
           moveSpeed *= DRONE_CHASER_SPEED_MULT;
-          if (hDist > 0.08 && distToPlayer < DRONE_ATTACK_MIN_DIST) {
+          if (coordHold) {
+            moveSpeed *= DRONE_COORD_HOLD_SPEED_MULT;
+            const holdR = DRONE_CLOSE_CHASE_RADIUS + 6.2;
+            const spread = (d.id * 2.399963229728653) % (Math.PI * 2);
+            tx = px + Math.cos(spread) * holdR;
+            tz = pz + Math.sin(spread) * holdR;
+          } else if (hDist > 0.08 && distToPlayer < DRONE_ATTACK_MIN_DIST) {
             const inv = 1 / hDist;
             const ringR = DRONE_ATTACK_MIN_DIST + 2;
             tx = px + hdx * inv * ringR;
@@ -326,14 +411,49 @@ export function createDronesSystem(deps) {
         }
       }
 
-      const tdx = tx - b.position.x;
-      const tdz = tz - b.position.z;
-      const distH = Math.sqrt(tdx * tdx + tdz * tdz);
+      let tdx = tx - b.position.x;
+      let tdz = tz - b.position.z;
+      let distH = Math.sqrt(tdx * tdx + tdz * tdz);
 
-      if (distH > 0.02) {
-        const inv = 1 / distH;
-        b.velocity.x = tdx * inv * moveSpeed;
-        b.velocity.z = tdz * inv * moveSpeed;
+      let nx = 0;
+      let nz = 0;
+      if (distH > 0.001) {
+        const invH = 1 / distH;
+        nx = tdx * invH;
+        nz = tdz * invH;
+      }
+
+      let sx = 0;
+      let sz = 0;
+      const sepR = DRONE_SEPARATION_RADIUS;
+      const sepR2 = sepR * sepR;
+      for (const other of drones) {
+        if (other === d || other.dying) continue;
+        const ob = other.body;
+        const ox2 = b.position.x - ob.position.x;
+        const oz2 = b.position.z - ob.position.z;
+        const dh2 = ox2 * ox2 + oz2 * oz2;
+        if (dh2 < 0.0001 || dh2 >= sepR2) continue;
+        const dh = Math.sqrt(dh2);
+        const push = (sepR - dh) / sepR;
+        sx += (ox2 / dh) * push;
+        sz += (oz2 / dh) * push;
+      }
+      const slen = Math.sqrt(sx * sx + sz * sz);
+      if (slen > 0.001) {
+        const invS = 1 / slen;
+        nx += sx * invS * DRONE_SEPARATION_WEIGHT;
+        nz += sz * invS * DRONE_SEPARATION_WEIGHT;
+      }
+      const flen = Math.sqrt(nx * nx + nz * nz);
+      let effSpeed = moveSpeed;
+      if (moveSpeed < 0.05 && flen > 0.02) {
+        effSpeed = Math.max(moveSpeed, 2.1);
+      }
+      if (flen > 0.02) {
+        const invF = 1 / flen;
+        b.velocity.x = nx * invF * effSpeed;
+        b.velocity.z = nz * invF * effSpeed;
       } else {
         b.velocity.x = 0;
         b.velocity.z = 0;
@@ -374,6 +494,12 @@ export function createDronesSystem(deps) {
       b.position.y = r;
       b.velocity.y = 0;
       d.mesh.position.copy(b.position);
+      if (!d.elite && d.behaviorType === DRONE_TYPE_SHOOTER) {
+        const atk =
+          d.aiState === 'aiming' || d.aiState === 'attacking';
+        d.mesh.material.emissiveIntensity =
+          d.baseEmissiveIntensity + (atk ? DRONE_ATTACKING_EMISSIVE_BOOST : 0);
+      }
       if (d.aimInAttackBand) {
         d.mesh.lookAt(playerTarget.position);
       }

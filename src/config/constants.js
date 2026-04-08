@@ -52,6 +52,24 @@ export const DRONE_ORBITER_LINEAR_DAMPING = 0.28;
 /** Chaser: algo más rápido que la base. */
 export const DRONE_CHASER_SPEED_MULT = 1.2;
 
+/** --- IA V2: separación, coordinación, tirador por fases */
+export const DRONE_SEPARATION_RADIUS = 2.85;
+/** Mezcla del vector de separación con la dirección deseada (0–1). */
+export const DRONE_SEPARATION_WEIGHT = 0.45;
+/** Distancia horizontal jugador–dron para contar “cerca” (solo chasers). */
+export const DRONE_CLOSE_CHASE_RADIUS = 9.5;
+/** Cuántos chasers pueden presionar a máxima velocidad en ese radio. */
+export const DRONE_MAX_CLOSE_CHASERS = 3;
+export const DRONE_COORD_HOLD_SPEED_MULT = 0.38;
+/** Tirador: fases aim → burst → cooldown; solo disparar en esta banda. */
+export const DRONE_SHOOTER_FIRE_MIN_DIST = 7;
+export const DRONE_SHOOTER_FIRE_MAX_DIST = 31;
+export const DRONE_SHOOTER_AIM_TIME = 0.5;
+/** Pausa tras ráfaga antes del siguiente ciclo (s). */
+export const DRONE_SHOOTER_PHASE_COOLDOWN = 2.0;
+/** Bonus de emissive al apuntar/disparar (tiradores). */
+export const DRONE_ATTACKING_EMISSIVE_BOOST = 0.65;
+
 /** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
 export const PLAYER_HIT_RADIUS = 0.64;
 
