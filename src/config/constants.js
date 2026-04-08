@@ -6,6 +6,26 @@
 /** Altura de los ojos respecto al suelo (m). ~1,74 ≈ persona ~1,80 m; más alto que antes para apuntar abajo sin “clavar” en el plano. */
 export const PLAYER_EYE_HEIGHT = 1.74;
 export const MOVE_SPEED = 12;
+/** Sprint (Shift): multiplicador sobre MOVE_SPEED; gasta stamina. */
+export const SPRINT_SPEED_MULT = 1.58;
+export const STAMINA_MAX = 100;
+export const STAMINA_REGEN_PER_SEC = 24;
+export const STAMINA_DRAIN_SPRINT_PER_SEC = 44;
+export const STAMINA_JUMP_COST = 26;
+export const STAMINA_HOVER_DRAIN_PER_SEC = 36;
+/** Impulso vertical inicial al saltar (m/s). */
+export const PLAYER_JUMP_VELOCITY = 10.2;
+/** Empuje hacia arriba mientras mantienes espacio en el aire (levitar). */
+export const PLAYER_HOVER_UP_ACCEL = 18;
+/** Gravedad del jugador (m/s²) cuando está en el aire. */
+export const PLAYER_MOVE_GRAVITY = 28;
+/** Puntos base por kill antes del multiplicador. */
+export const SCORE_PER_KILL_BASE = 100;
+/** Incremento del multiplicador por kill consecutivo sin recibir daño. */
+export const COMBO_MULT_PER_KILL = 0.12;
+export const COMBO_MULT_MAX = 3.5;
+/** Radio horizontal para empujar al jugador fuera de muros del laberinto. */
+export const PLAYER_WALL_RADIUS = 0.48;
 /** Alcance máximo del rayo de telequinesis (más pequeño = “escudo” más ajustado). */
 export const GRAB_REACH = 18;
 export const PULL_GAIN = 10;

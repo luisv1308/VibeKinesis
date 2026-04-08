@@ -95,6 +95,33 @@
         letter-spacing: 0.15em;
         font-size: 15px;
       }
+      #hudStaminaWrap {
+        margin-top: 6px;
+        width: 160px;
+        margin-left: auto;
+      }
+      #hudStaminaBar {
+        height: 7px;
+        border-radius: 3px;
+        background: rgba(40, 50, 70, 0.85);
+        overflow: hidden;
+        border: 1px solid rgba(120, 180, 255, 0.35);
+      }
+      #hudStaminaFill {
+        height: 100%;
+        width: 100%;
+        background: linear-gradient(90deg, #3a8cff, #6ae0c8);
+        transform-origin: left center;
+        transform: scaleX(1);
+      }
+      #hudScore {
+        color: #ffcc66;
+        font-weight: 600;
+      }
+      #hudCombo {
+        color: #9cf0ff;
+        font-size: 13px;
+      }
       #waveBanner,
       #wavePrepare {
         position: fixed;
@@ -165,10 +192,15 @@
   </head>
   <body>
     <div id="gameHud" aria-live="polite">
+      <div class="hud-row" id="hudScore">Puntos: 0</div>
+      <div class="hud-row" id="hudCombo">Combo ×1.00</div>
       <div class="hud-row" id="hudKills">Derrotados: 0</div>
       <div class="hud-row" id="hudTime">00:00</div>
       <div class="hud-row" id="hudWave">Ola 1</div>
       <div class="hud-row" id="hudLives">♥♥♥</div>
+      <div id="hudStaminaWrap" aria-hidden="true">
+        <div id="hudStaminaBar"><div id="hudStaminaFill"></div></div>
+      </div>
     </div>
     <div
       id="gameOverOverlay"
@@ -178,8 +210,12 @@
     >
       <h2 id="gameOverTitle">Game Over</h2>
       <p>
-        Puntuación (enemigos derrotados):
+        Puntuación:
         <span id="gameOverScore">0</span>
+      </p>
+      <p style="margin-top: 8px; font-size: 1.05rem">
+        Récord:
+        <span id="gameOverHighScore" style="color: #9cf0ff">0</span>
       </p>
       <p style="margin-top: 14px; font-size: 0.95rem; opacity: 0.8">
         Clic para jugar de nuevo
@@ -193,7 +229,7 @@
       <div>
         <h1>Clic para jugar</h1>
         <p>
-          WASD para mover, ratón para mirar.<br />
+          WASD para mover, Shift para correr (stamina), Espacio salto / mantener para levitar en el aire (stamina), ratón para mirar.<br />
           Mano izquierda (clic izquierdo): escudo magnético (de frente).<br />
           Con escudo: cubos y balas a ≤3 m del vórtice se atraen; 2+ objetos muestran línea amarilla.<br />
           Tab: cambiar par seleccionado si hay más de 2 atrapados. E: fusionar par → cubo explosivo (amarillo).<br />

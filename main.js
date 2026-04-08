@@ -25,6 +25,8 @@ import {
   COLLISION_GROUP_FUSION_B,
   COLLISION_GROUP_PLAYER_BODY,
   COLLISION_MASK_ENEMY_PROJECTILE,
+  COMBO_MULT_MAX,
+  COMBO_MULT_PER_KILL,
   DRONE_TYPE_CHASER,
   DRONE_TYPE_ORBITER,
   DRONE_TYPE_SHOOTER,
@@ -62,6 +64,10 @@ import {
   MEGA_CUBE_HALF,
   MEGA_CUBE_MASS,
   MOVE_SPEED,
+  PLAYER_HOVER_UP_ACCEL,
+  PLAYER_JUMP_VELOCITY,
+  PLAYER_MOVE_GRAVITY,
+  PLAYER_WALL_RADIUS,
   PLASMA_MAX_TIER,
   PLASMA_PICK_SCALE_PER_TIER,
   PLASMA_PIERCE_PER_STACK,
@@ -85,9 +91,16 @@ import {
   PROJ_SPAWN_CLEARANCE,
   PROJ_VISUAL_SCALE,
   PULL_GAIN,
+  SCORE_PER_KILL_BASE,
   PULL_MAX_SPEED,
   SPAWN_RING_INNER,
   SPAWN_RING_OUTER,
+  SPRINT_SPEED_MULT,
+  STAMINA_DRAIN_SPRINT_PER_SEC,
+  STAMINA_HOVER_DRAIN_PER_SEC,
+  STAMINA_JUMP_COST,
+  STAMINA_MAX,
+  STAMINA_REGEN_PER_SEC,
   TEST_MG_A,
   TEST_MG_B,
   TEST_MG_FIRE_INTERVAL,
@@ -367,10 +380,14 @@ const hudKillsEl = document.getElementById('hudKills');
 const hudTimeEl = document.getElementById('hudTime');
 const hudWaveEl = document.getElementById('hudWave');
 const hudLivesEl = document.getElementById('hudLives');
+const hudScoreEl = document.getElementById('hudScore');
+const hudComboEl = document.getElementById('hudCombo');
+const hudStaminaFillEl = document.getElementById('hudStaminaFill');
 const waveBannerEl = document.getElementById('waveBanner');
 const wavePrepareEl = document.getElementById('wavePrepare');
 const gameOverOverlayEl = document.getElementById('gameOverOverlay');
 const gameOverScoreEl = document.getElementById('gameOverScore');
+const gameOverHighScoreEl = document.getElementById('gameOverHighScore');
 
 let isGameOver = false;
 let enemiesDefeated = 0;
@@ -388,6 +405,13 @@ let tryWaveEndCheck = () => {};
 let normalKillsForElite = 0;
 let gameTimeSec = 0;
 let playerLives = 3;
+let gameScore = 0;
+let comboMultiplier = 1;
+let stamina = STAMINA_MAX;
+let playerEyeY = PLAYER_EYE_HEIGHT;
+let playerVerticalVel = 0;
+let pendingJump = false;
+const HIGH_SCORE_KEY = 'vibe-gamejam-highscore';
 
 function formatTimeMMSS(totalSec) {
   const s = Math.max(0, Math.floor(totalSec));
@@ -397,6 +421,14 @@ function formatTimeMMSS(totalSec) {
 }
 
 function updateGameHud() {
+  if (hudScoreEl) hudScoreEl.textContent = `Puntos: ${gameScore}`;
+  if (hudComboEl) {
+    hudComboEl.textContent = `Combo ×${comboMultiplier.toFixed(2)}`;
+  }
+  if (hudStaminaFillEl) {
+    const t = Math.max(0, Math.min(1, stamina / STAMINA_MAX));
+    hudStaminaFillEl.style.transform = `scaleX(${t})`;
+  }
   if (hudKillsEl) hudKillsEl.textContent = `Derrotados: ${enemiesDefeated}`;
   if (hudTimeEl) hudTimeEl.textContent = formatTimeMMSS(gameTimeSec);
   const wave = Math.max(1, waveState.currentWave || 1);
@@ -419,7 +451,18 @@ function showGameOver() {
     pauseOverlayEl.classList.remove('visible');
     pauseOverlayEl.setAttribute('aria-hidden', 'true');
   }
-  if (gameOverScoreEl) gameOverScoreEl.textContent = String(enemiesDefeated);
+  if (gameOverScoreEl) gameOverScoreEl.textContent = String(gameScore);
+  let best = 0;
+  try {
+    best = Math.max(
+      Number(localStorage.getItem(HIGH_SCORE_KEY)) || 0,
+      gameScore
+    );
+    localStorage.setItem(HIGH_SCORE_KEY, String(best));
+  } catch {
+    best = gameScore;
+  }
+  if (gameOverHighScoreEl) gameOverHighScoreEl.textContent = String(best);
   if (gameOverOverlayEl) {
     gameOverOverlayEl.classList.add('visible');
     gameOverOverlayEl.setAttribute('aria-hidden', 'false');
@@ -431,6 +474,7 @@ function showGameOver() {
 function onPlayerHit() {
   if (isGameOver) return;
   playerLives -= 1;
+  comboMultiplier = 1;
   triggerDamageFeedback();
   updateGameHud();
   if (playerLives <= 0) showGameOver();
@@ -576,6 +620,51 @@ world.addBody(groundBody);
   addWall(0, yc, -AH - T, AH + T, H * 0.5, T);
 }
 
+/** Muros estáticos interiores (laberinto); colisión jugador en XZ + física general. */
+const mazeWallColliders = [];
+{
+  const halfH = 2.25;
+  const y0 = halfH;
+  const mazeMat = new THREE.MeshStandardMaterial({
+    color: 0x323e52,
+    roughness: 0.88,
+    metalness: 0.11,
+    emissive: 0x081420,
+    emissiveIntensity: 0.2,
+  });
+  const addMazeSeg = (cx, cz, halfW, halfD) => {
+    const shape = new CANNON.Box(new CANNON.Vec3(halfW, halfH, halfD));
+    const body = new CANNON.Body({ mass: 0 });
+    body.addShape(shape);
+    body.position.set(cx, y0, cz);
+    body.userData = { isMazeWall: true };
+    world.addBody(body);
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(halfW * 2, halfH * 2, halfD * 2),
+      mazeMat
+    );
+    mesh.position.set(cx, y0, cz);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    mazeWallColliders.push({
+      minX: cx - halfW,
+      maxX: cx + halfW,
+      minZ: cz - halfD,
+      maxZ: cz + halfD,
+    });
+  };
+  addMazeSeg(0, -16, 17, 0.9);
+  addMazeSeg(0, 16, 17, 0.9);
+  addMazeSeg(-16, 0, 0.9, 13);
+  addMazeSeg(16, 0, 0.9, 13);
+  addMazeSeg(-7, -7, 8, 0.9);
+  addMazeSeg(7, 7, 8, 0.9);
+  addMazeSeg(0, 0, 0.95, 10);
+  addMazeSeg(-11, 11, 5.5, 0.9);
+  addMazeSeg(11, -11, 5.5, 0.9);
+}
+
 const playerBody = new CANNON.Body({ mass: 0 });
 playerBody.type = CANNON.Body.STATIC;
 playerBody.addShape(new CANNON.Sphere(PLAYER_HIT_RADIUS));
@@ -609,6 +698,12 @@ const {
   addCombatShake: (amp) => addEliteCombatShake(amp),
   onDroneKill(drone, { requestEliteSpawn }) {
     enemiesDefeated += 1;
+    const pts = Math.floor(SCORE_PER_KILL_BASE * comboMultiplier);
+    gameScore += pts;
+    comboMultiplier = Math.min(
+      COMBO_MULT_MAX,
+      comboMultiplier + COMBO_MULT_PER_KILL
+    );
     if (waveState.isWaveActive) {
       waveState.enemiesRemainingInWave -= 1;
     }
@@ -2927,6 +3022,9 @@ const keys = {
   KeyA: false,
   KeyS: false,
   KeyD: false,
+  Space: false,
+  ShiftLeft: false,
+  ShiftRight: false,
 };
 
 window.addEventListener('keydown', (e) => {
@@ -2961,8 +3059,16 @@ window.addEventListener('keydown', (e) => {
       keys.KeyA = false;
       keys.KeyS = false;
       keys.KeyD = false;
+      keys.Space = false;
+      keys.ShiftLeft = false;
+      keys.ShiftRight = false;
+      pendingJump = false;
     }
     return;
+  }
+  if (e.code === 'Space' && !e.repeat && controls.isLocked && !isPaused && !isGameOver) {
+    e.preventDefault();
+    pendingJump = true;
   }
   if (keys.hasOwnProperty(e.code)) keys[e.code] = true;
 });
@@ -2986,6 +3092,38 @@ function syncMeshesFromPhysics() {
     mesh.position.copy(b.position);
     mesh.quaternion.copy(b.quaternion);
   }
+}
+
+function resolvePlayerXZAgainstMaze(px, pz, radius) {
+  let x = px;
+  let z = pz;
+  const r = radius;
+  for (const box of mazeWallColliders) {
+    const qx = THREE.MathUtils.clamp(x, box.minX, box.maxX);
+    const qz = THREE.MathUtils.clamp(z, box.minZ, box.maxZ);
+    let dx = x - qx;
+    let dz = z - qz;
+    const d2 = dx * dx + dz * dz;
+    if (d2 < 1e-10) {
+      const distLeft = x - box.minX;
+      const distRight = box.maxX - x;
+      const distDown = z - box.minZ;
+      const distUp = box.maxZ - z;
+      const minD = Math.min(distLeft, distRight, distDown, distUp);
+      if (minD === distLeft) x = box.minX - r;
+      else if (minD === distRight) x = box.maxX + r;
+      else if (minD === distDown) z = box.minZ - r;
+      else z = box.maxZ + r;
+      continue;
+    }
+    if (d2 >= r * r) continue;
+    const d = Math.sqrt(d2);
+    dx /= d;
+    dz /= d;
+    x = qx + dx * r;
+    z = qz + dz * r;
+  }
+  return { x, z };
 }
 
 function syncPlayerHitBody() {
@@ -3023,16 +3161,68 @@ function animate() {
     if (keys.KeyS) moveDir.sub(forward);
     if (keys.KeyD) moveDir.add(right);
     if (keys.KeyA) moveDir.sub(right);
-    if (moveDir.lengthSq() > 0) {
-      moveDir.normalize().multiplyScalar(MOVE_SPEED * dt);
+    const hasMoveInput = moveDir.lengthSq() > 0;
+    let moveSpeed = MOVE_SPEED;
+    const sprintHeld =
+      (keys.ShiftLeft || keys.ShiftRight) && stamina > 0 && hasMoveInput;
+    if (sprintHeld) {
+      moveSpeed *= SPRINT_SPEED_MULT;
+    }
+    if (hasMoveInput) {
+      moveDir.normalize().multiplyScalar(moveSpeed * dt);
       camera.position.x += moveDir.x;
       camera.position.z += moveDir.z;
     }
-    camera.position.y = PLAYER_EYE_HEIGHT;
+    const resolved = resolvePlayerXZAgainstMaze(
+      camera.position.x,
+      camera.position.z,
+      PLAYER_WALL_RADIUS
+    );
+    camera.position.x = resolved.x;
+    camera.position.z = resolved.z;
 
-    const half = 58;
+    const half = ARENA_HALF;
     camera.position.x = THREE.MathUtils.clamp(camera.position.x, -half, half);
     camera.position.z = THREE.MathUtils.clamp(camera.position.z, -half, half);
+
+    let grounded =
+      playerEyeY <= PLAYER_EYE_HEIGHT + 0.08 && playerVerticalVel <= 0.35;
+    if (grounded) {
+      playerEyeY = PLAYER_EYE_HEIGHT;
+      playerVerticalVel = 0;
+    }
+    if (pendingJump && grounded && stamina >= STAMINA_JUMP_COST) {
+      playerVerticalVel = PLAYER_JUMP_VELOCITY;
+      stamina -= STAMINA_JUMP_COST;
+      pendingJump = false;
+      grounded = false;
+    } else {
+      pendingJump = false;
+    }
+    if (!grounded) {
+      playerVerticalVel -= PLAYER_MOVE_GRAVITY * dt;
+      if (keys.Space && stamina > 0) {
+        playerVerticalVel += PLAYER_HOVER_UP_ACCEL * dt;
+        stamina -= STAMINA_HOVER_DRAIN_PER_SEC * dt;
+      }
+      playerEyeY += playerVerticalVel * dt;
+      if (playerEyeY <= PLAYER_EYE_HEIGHT) {
+        playerEyeY = PLAYER_EYE_HEIGHT;
+        playerVerticalVel = 0;
+      }
+      if (playerEyeY > ARENA_Y_MAX) {
+        playerEyeY = ARENA_Y_MAX;
+        playerVerticalVel = Math.min(0, playerVerticalVel);
+      }
+    }
+    camera.position.y = playerEyeY;
+
+    let stDelta = STAMINA_REGEN_PER_SEC;
+    if (sprintHeld) {
+      stDelta -= STAMINA_DRAIN_SPRINT_PER_SEC;
+    }
+    stamina += stDelta * dt;
+    stamina = THREE.MathUtils.clamp(stamina, 0, STAMINA_MAX);
 
     if (grabbedBody) {
       camera.getWorldDirection(aimDir);
