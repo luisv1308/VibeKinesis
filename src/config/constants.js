@@ -210,6 +210,8 @@ export const FUSION_PREVIEW_INTENSITY_CUBE = 1.25;
 export const FUSION_PREVIEW_INTENSITY_PROJ = 2.65;
 /** Mismo límite horizontal que el jugador (cámara clamp ±ARENA_HALF). Fuera → se elimina el disparo enemigo. */
 export const ARENA_HALF = 58;
+/** Modo misión: arena más grande (sin sensación de “habitación” pequeña). */
+export const MISSION_ARENA_HALF = 168;
 export const ARENA_Y_MIN = -2;
 export const ARENA_Y_MAX = 80;
 /** Límites físicos del arena (paredes; más gruesas = menos tunelado a alta velocidad). */

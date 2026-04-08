@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>FPS + cubos con física</title>
+    <title>Vibe Arena</title>
     <style>
       * {
         margin: 0;
@@ -15,6 +15,67 @@
         height: 100%;
         background: #0a0a12;
         font-family: system-ui, sans-serif;
+      }
+      #titleMenu {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: radial-gradient(ellipse 120% 80% at 50% 20%, #1a2238 0%, #0a0a14 55%);
+        z-index: 7;
+        color: #e8f0ff;
+        text-align: center;
+        padding: 32px 20px;
+        gap: 28px;
+      }
+      #titleMenu.hidden {
+        display: none;
+      }
+      #titleMenu h1 {
+        font-size: clamp(1.75rem, 5vw, 2.6rem);
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        text-shadow:
+          0 0 28px rgba(100, 180, 255, 0.45),
+          0 4px 24px rgba(0, 0, 0, 0.6);
+        margin: 0;
+      }
+      #titleMenu .subtitle {
+        opacity: 0.82;
+        font-size: 0.95rem;
+        max-width: 420px;
+        line-height: 1.45;
+      }
+      #titleMenu .mode-buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        justify-content: center;
+      }
+      #titleMenu button {
+        min-width: 200px;
+        padding: 14px 22px;
+        font-size: 1rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        border: 1px solid rgba(120, 190, 255, 0.45);
+        border-radius: 10px;
+        background: linear-gradient(180deg, rgba(40, 70, 120, 0.55), rgba(20, 30, 55, 0.85));
+        color: #e8f4ff;
+        cursor: pointer;
+        transition:
+          transform 0.12s ease,
+          box-shadow 0.12s ease;
+      }
+      #titleMenu button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 28px rgba(60, 120, 200, 0.35);
+      }
+      #titleMenu button:focus-visible {
+        outline: 2px solid #6ad0ff;
+        outline-offset: 3px;
       }
       #blocker {
         position: fixed;
@@ -221,14 +282,26 @@
         Clic para jugar de nuevo
       </p>
     </div>
+    <div id="titleMenu" role="dialog" aria-labelledby="gameTitle" aria-modal="true">
+      <h1 id="gameTitle">Vibe Arena</h1>
+      <p class="subtitle">Elige un modo de juego.</p>
+      <div class="mode-buttons">
+        <button type="button" id="btnModeWaves" aria-describedby="gameTitle">
+          Modo olas
+        </button>
+        <button type="button" id="btnModeMission" aria-describedby="gameTitle">
+          Modo misión
+        </button>
+      </div>
+    </div>
     <div id="wavePrepare" aria-hidden="true"></div>
     <div id="waveBanner" aria-hidden="true"></div>
     <div id="pauseOverlay" aria-hidden="true">PAUSA · P</div>
     <div id="damageFlash" aria-hidden="true"></div>
-    <div id="blocker">
+    <div id="blocker" class="hidden">
       <div>
-        <h1>Clic para jugar</h1>
-        <p>
+        <h1 id="blockerHeading">Clic para jugar</h1>
+        <p id="blockerInstructions">
           WASD para mover, Shift para correr (stamina), Espacio salto / mantener para levitar en el aire (stamina), ratón para mirar.<br />
           Mano izquierda (clic izquierdo): escudo magnético (de frente).<br />
           Con escudo: cubos y balas a ≤3 m del vórtice se atraen; 2+ objetos muestran línea amarilla.<br />

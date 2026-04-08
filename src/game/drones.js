@@ -76,6 +76,7 @@ export function createDronesSystem(deps) {
     createEnemyProjectile,
     addCombatShake = () => {},
     onDroneKill,
+    getSpawnClampHalf = () => ARENA_HALF,
   } = deps;
 
   const eliteShieldGeo = new THREE.SphereGeometry(1, 18, 18);
@@ -327,7 +328,7 @@ export function createDronesSystem(deps) {
     let x = pt.x + Math.cos(angle) * dist;
     let z = pt.z + Math.sin(angle) * dist;
     const y = 0.9 + Math.random() * 5;
-    const half = ARENA_HALF;
+    const half = getSpawnClampHalf();
     x = THREE.MathUtils.clamp(x, -half, half);
     z = THREE.MathUtils.clamp(z, -half, half);
     return { x, y, z };

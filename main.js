@@ -7,6 +7,7 @@ import * as CANNON from 'cannon-es';
 import { createDronesSystem } from './src/game/drones.js';
 import {
   ARENA_HALF,
+  MISSION_ARENA_HALF,
   ARENA_WALL_HALF_THICK,
   ARENA_WALL_HEIGHT,
   ARENA_Y_MAX,
@@ -130,7 +131,7 @@ const camera = new THREE.PerspectiveCamera(
   75,
   window.innerWidth / window.innerHeight,
   0.1,
-  200
+  520
 );
 camera.position.set(0, PLAYER_EYE_HEIGHT, 8);
 scene.add(camera);
@@ -371,7 +372,15 @@ updateHudLayout();
 const controls = new PointerLockControls(camera, document.body);
 
 const blocker = document.getElementById('blocker');
+const titleMenuEl = document.getElementById('titleMenu');
+const btnModeWaves = document.getElementById('btnModeWaves');
+const btnModeMission = document.getElementById('btnModeMission');
+const blockerHeadingEl = document.getElementById('blockerHeading');
+const blockerInstructionsEl = document.getElementById('blockerInstructions');
 const pauseOverlayEl = document.getElementById('pauseOverlay');
+
+/** 'menu' | 'waves' | 'mission' */
+let gameMode = 'menu';
 let isPaused = false;
 const damageFlashEl = document.getElementById('damageFlash');
 let damageFlashTimer = 0;
@@ -432,7 +441,15 @@ function updateGameHud() {
   if (hudKillsEl) hudKillsEl.textContent = `Derrotados: ${enemiesDefeated}`;
   if (hudTimeEl) hudTimeEl.textContent = formatTimeMMSS(gameTimeSec);
   const wave = Math.max(1, waveState.currentWave || 1);
-  if (hudWaveEl) hudWaveEl.textContent = `Ola ${wave}`;
+  if (hudWaveEl) {
+    if (gameMode === 'mission') {
+      hudWaveEl.textContent = 'Misión';
+    } else if (gameMode === 'menu') {
+      hudWaveEl.textContent = '—';
+    } else {
+      hudWaveEl.textContent = `Ola ${wave}`;
+    }
+  }
   if (hudLivesEl) {
     hudLivesEl.textContent = '♥'.repeat(Math.max(0, playerLives));
   }
@@ -482,10 +499,68 @@ function onPlayerHit() {
 
 document.addEventListener('click', () => {
   if (isGameOver) return;
+  if (gameMode === 'menu') return;
   if (!controls.isLocked) {
     controls.lock();
   }
 });
+
+function applyBlockerCopyForMode() {
+  if (!blockerHeadingEl || !blockerInstructionsEl) return;
+  const common = `WASD para mover, Shift para correr (stamina), Espacio salto / mantener para levitar en el aire (stamina), ratón para mirar.<br />
+          Mano izquierda (clic izquierdo): escudo magnético (de frente).<br />
+          Con escudo: cubos y balas a ≤3 m del vórtice se atraen; 2+ objetos muestran línea amarilla.<br />
+          Tab: cambiar par seleccionado si hay más de 2 atrapados. E: fusionar par → cubo explosivo (amarillo).<br />
+          Mano derecha (clic derecho): telequinesis — atrae lo señalado con la mira.<br />
+          Suelta el clic derecho para lanzarlo; el resultado de fusión queda enganchado al instante.<br />
+          P: pausa (no aparecen enemigos ni avanza la física).`;
+  if (gameMode === 'mission') {
+    blockerHeadingEl.textContent = 'Clic para jugar · Modo misión';
+    blockerInstructionsEl.innerHTML = `Mapa amplio con estructuras interiores; sin oleadas automáticas (objetivos de misión en desarrollo). ${common}`;
+  } else {
+    blockerHeadingEl.textContent = 'Clic para jugar · Modo olas';
+    blockerInstructionsEl.innerHTML = common;
+  }
+}
+
+function selectGameMode(mode) {
+  gameMode = mode;
+  if (mode === 'mission') buildMissionArena();
+  else if (mode === 'waves') buildWavesArena();
+  if (titleMenuEl) {
+    titleMenuEl.classList.add('hidden');
+    titleMenuEl.setAttribute('aria-hidden', 'true');
+  }
+  if (blocker) {
+    blocker.classList.remove('hidden');
+  }
+  applyBlockerCopyForMode();
+  updateGameHud();
+}
+
+if (btnModeWaves) {
+  btnModeWaves.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    selectGameMode('waves');
+  });
+}
+if (btnModeMission) {
+  btnModeMission.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    selectGameMode('mission');
+  });
+}
+
+function getActiveArenaHalf() {
+  return gameMode === 'mission' ? MISSION_ARENA_HALF : ARENA_HALF;
+}
+
+function resetPlayerSpawn() {
+  camera.position.set(0, PLAYER_EYE_HEIGHT, 8);
+  playerTarget.position.copy(camera.position);
+}
 
 controls.addEventListener('lock', () => {
   blocker.classList.add('hidden');
@@ -526,7 +601,7 @@ sun.shadow.camera.top = 30;
 sun.shadow.camera.bottom = -30;
 scene.add(sun);
 
-const groundGeo = new THREE.PlaneGeometry(120, 120);
+const groundGeo = new THREE.PlaneGeometry(400, 400);
 const groundMat = new THREE.MeshStandardMaterial({
   color: 0x1e2430,
   roughness: 0.92,
@@ -586,18 +661,61 @@ groundBody.addShape(groundShape);
 groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
 world.addBody(groundBody);
 
-{
+const arenaWallEntries = [];
+const missionInteriorEntries = [];
+
+function applySunShadowForArenaHalf(half) {
+  const margin = 14;
+  const s = half + margin;
+  sun.shadow.camera.left = -s;
+  sun.shadow.camera.right = s;
+  sun.shadow.camera.top = s;
+  sun.shadow.camera.bottom = -s;
+  sun.shadow.camera.far = Math.max(120, half * 2 + 48);
+  sun.shadow.camera.updateProjectionMatrix();
+}
+
+/** Muros interiores modo misión; colisión jugador en XZ + física general. */
+const mazeWallColliders = [];
+
+const arenaOuterWallMat = new THREE.MeshStandardMaterial({
+  color: 0x2a3144,
+  roughness: 0.9,
+  metalness: 0.1,
+  emissive: 0x080c18,
+  emissiveIntensity: 0.22,
+});
+const missionInteriorWallMat = new THREE.MeshStandardMaterial({
+  color: 0x2a3548,
+  roughness: 0.9,
+  metalness: 0.1,
+  emissive: 0x0a1118,
+  emissiveIntensity: 0.2,
+});
+
+function clearArenaWalls() {
+  for (const e of arenaWallEntries) {
+    world.removeBody(e.body);
+    scene.remove(e.mesh);
+    e.mesh.geometry.dispose();
+  }
+  arenaWallEntries.length = 0;
+}
+
+function clearMissionInterior() {
+  for (const e of missionInteriorEntries) {
+    world.removeBody(e.body);
+    scene.remove(e.mesh);
+    e.mesh.geometry.dispose();
+  }
+  missionInteriorEntries.length = 0;
+  mazeWallColliders.length = 0;
+}
+
+function addArenaOuterWalls(half) {
   const H = ARENA_WALL_HEIGHT;
-  const AH = ARENA_HALF;
   const T = ARENA_WALL_HALF_THICK;
   const yc = H * 0.5;
-  const wallMat = new THREE.MeshStandardMaterial({
-    color: 0x2a3144,
-    roughness: 0.9,
-    metalness: 0.1,
-    emissive: 0x080c18,
-    emissiveIntensity: 0.22,
-  });
   const addWall = (cx, cy, cz, hx, hy, hz) => {
     const shape = new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
     const body = new CANNON.Body({ mass: 0 });
@@ -607,32 +725,24 @@ world.addBody(groundBody);
     world.addBody(body);
     const mesh = new THREE.Mesh(
       new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2),
-      wallMat
+      arenaOuterWallMat
     );
     mesh.position.set(cx, cy, cz);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     scene.add(mesh);
+    arenaWallEntries.push({ body, mesh });
   };
-  addWall(AH + T, yc, 0, T, H * 0.5, AH + T);
-  addWall(-AH - T, yc, 0, T, H * 0.5, AH + T);
-  addWall(0, yc, AH + T, AH + T, H * 0.5, T);
-  addWall(0, yc, -AH - T, AH + T, H * 0.5, T);
+  addWall(half + T, yc, 0, T, H * 0.5, half + T);
+  addWall(-half - T, yc, 0, T, H * 0.5, half + T);
+  addWall(0, yc, half + T, half + T, H * 0.5, T);
+  addWall(0, yc, -half - T, half + T, H * 0.5, T);
 }
 
-/** Muros estáticos interiores (laberinto); colisión jugador en XZ + física general. */
-const mazeWallColliders = [];
-{
+function buildMissionInterior() {
   const halfH = 2.25;
   const y0 = halfH;
-  const mazeMat = new THREE.MeshStandardMaterial({
-    color: 0x323e52,
-    roughness: 0.88,
-    metalness: 0.11,
-    emissive: 0x081420,
-    emissiveIntensity: 0.2,
-  });
-  const addMazeSeg = (cx, cz, halfW, halfD) => {
+  const addSeg = (cx, cz, halfW, halfD) => {
     const shape = new CANNON.Box(new CANNON.Vec3(halfW, halfH, halfD));
     const body = new CANNON.Body({ mass: 0 });
     body.addShape(shape);
@@ -641,7 +751,7 @@ const mazeWallColliders = [];
     world.addBody(body);
     const mesh = new THREE.Mesh(
       new THREE.BoxGeometry(halfW * 2, halfH * 2, halfD * 2),
-      mazeMat
+      missionInteriorWallMat
     );
     mesh.position.set(cx, y0, cz);
     mesh.castShadow = true;
@@ -653,17 +763,90 @@ const mazeWallColliders = [];
       minZ: cz - halfD,
       maxZ: cz + halfD,
     });
+    missionInteriorEntries.push({ body, mesh });
   };
-  addMazeSeg(0, -16, 17, 0.9);
-  addMazeSeg(0, 16, 17, 0.9);
-  addMazeSeg(-16, 0, 0.9, 13);
-  addMazeSeg(16, 0, 0.9, 13);
-  addMazeSeg(-7, -7, 8, 0.9);
-  addMazeSeg(7, 7, 8, 0.9);
-  addMazeSeg(0, 0, 0.95, 10);
-  addMazeSeg(-11, 11, 5.5, 0.9);
-  addMazeSeg(11, -11, 5.5, 0.9);
+
+  addSeg(0, 120, 88, 2.2);
+  addSeg(0, -120, 88, 2.2);
+  addSeg(120, 0, 2.2, 88);
+  addSeg(-120, 0, 2.2, 88);
+
+  addSeg(-45, 45, 24, 1.6);
+  addSeg(45, 45, 24, 1.6);
+  addSeg(-45, -45, 24, 1.6);
+  addSeg(45, -45, 24, 1.6);
+  addSeg(0, 75, 1.6, 28);
+  addSeg(0, -75, 1.6, 28);
+  addSeg(75, 0, 28, 1.6);
+  addSeg(-75, 0, 28, 1.6);
+
+  addSeg(0, 42, 36, 1.5);
+  addSeg(0, -38, 42, 1.5);
+  addSeg(-52, 8, 1.8, 46);
+  addSeg(52, 8, 1.8, 46);
+
+  addSeg(-28, 95, 20, 1.4);
+  addSeg(28, 95, 20, 1.4);
+  addSeg(0, 108, 48, 1.2);
+
+  addSeg(-32, -95, 22, 1.5);
+  addSeg(32, -95, 22, 1.5);
+  addSeg(0, -108, 1.5, 52);
+
+  addSeg(-88, 72, 1.2, 22);
+  addSeg(88, 72, 1.2, 22);
+  addSeg(-88, -72, 1.2, 22);
+  addSeg(88, -72, 1.2, 22);
+  addSeg(72, 88, 22, 1.2);
+  addSeg(-72, 88, 22, 1.2);
+  addSeg(72, -88, 22, 1.2);
+  addSeg(-72, -88, 22, 1.2);
+
+  addSeg(-100, 0, 12, 1.2);
+  addSeg(100, 0, 12, 1.2);
+  addSeg(0, -100, 1.2, 12);
+  addSeg(0, 100, 1.2, 12);
+
+  addSeg(-65, 65, 14, 0.9);
+  addSeg(65, 65, 14, 0.9);
+  addSeg(-65, -65, 14, 0.9);
+  addSeg(65, -65, 14, 0.9);
+
+  addSeg(-40, 58, 1.1, 16);
+  addSeg(40, 58, 1.1, 16);
+  addSeg(-40, -58, 1.1, 16);
+  addSeg(40, -58, 1.1, 16);
+
+  addSeg(-105, 105, 28, 28);
+  addSeg(105, 105, 28, 28);
+  addSeg(105, -105, 28, 28);
+  addSeg(-105, -105, 28, 28);
 }
+
+function buildWavesArena() {
+  clearArenaWalls();
+  clearMissionInterior();
+  addArenaOuterWalls(ARENA_HALF);
+  scene.fog.color.setHex(0x0c0c14);
+  scene.fog.near = 25;
+  scene.fog.far = 90;
+  applySunShadowForArenaHalf(ARENA_HALF);
+  resetPlayerSpawn();
+}
+
+function buildMissionArena() {
+  clearArenaWalls();
+  clearMissionInterior();
+  addArenaOuterWalls(MISSION_ARENA_HALF);
+  buildMissionInterior();
+  scene.fog.color.setHex(0x0c0c14);
+  scene.fog.near = 38;
+  scene.fog.far = 240;
+  applySunShadowForArenaHalf(MISSION_ARENA_HALF);
+  resetPlayerSpawn();
+}
+
+buildWavesArena();
 
 const playerBody = new CANNON.Body({ mass: 0 });
 playerBody.type = CANNON.Body.STATIC;
@@ -693,6 +876,7 @@ const {
   scene,
   world,
   playerTarget,
+  getSpawnClampHalf: getActiveArenaHalf,
   getCubeMeshes: () => cubeMeshes,
   createEnemyProjectile: (...a) => createEnemyProjectileRef(...a),
   addCombatShake: (amp) => addEliteCombatShake(amp),
@@ -1651,8 +1835,9 @@ function randomSpawnPointAroundPlayerForWave(kind) {
   let x = pt.x + Math.cos(angle) * dist;
   let z = pt.z + Math.sin(angle) * dist;
   const y = 0.9 + Math.random() * 5;
-  x = THREE.MathUtils.clamp(x, -ARENA_HALF, ARENA_HALF);
-  z = THREE.MathUtils.clamp(z, -ARENA_HALF, ARENA_HALF);
+  const ah = getActiveArenaHalf();
+  x = THREE.MathUtils.clamp(x, -ah, ah);
+  z = THREE.MathUtils.clamp(z, -ah, ah);
   return { x, y, z };
 }
 
@@ -1980,7 +2165,7 @@ function resolveProjectileArenaTunneling() {
 
     const r = getProjectileSphereRadius(ent);
     const pad = 0.06;
-    const lim = ARENA_HALF - r - pad;
+    const lim = getActiveArenaHalf() - r - pad;
     const p = ent.body.position;
     let nx = 0;
     let nz = 0;
@@ -2489,7 +2674,7 @@ function updateProjectileLife(dt) {
     }
     const p = ent.body.position;
     const escapeR =
-      ARENA_HALF +
+      getActiveArenaHalf() +
       2 * ARENA_WALL_HALF_THICK +
       PROJ_RADIUS +
       2.5;
@@ -3181,7 +3366,7 @@ function animate() {
     camera.position.x = resolved.x;
     camera.position.z = resolved.z;
 
-    const half = ARENA_HALF;
+    const half = getActiveArenaHalf();
     camera.position.x = THREE.MathUtils.clamp(camera.position.x, -half, half);
     camera.position.z = THREE.MathUtils.clamp(camera.position.z, -half, half);
 
@@ -3271,7 +3456,7 @@ function animate() {
   );
   leftHandSprite.position.set(handLeftBaseX, handBaseY, 0);
 
-  if (controls.isLocked && !isPaused && !isGameOver) {
+  if (controls.isLocked && !isPaused && !isGameOver && gameMode === 'waves') {
     if (!TEST_MODE_NO_DRONES) {
       if (!waveSystemBootstrapped) {
         waveSystemBootstrapped = true;
