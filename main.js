@@ -19,6 +19,7 @@ import {
   BUBBLE_WALL_RESTITUTION,
   BULLET_TIME_NEAR_DIST,
   BULLET_TIME_SCALE,
+  COLLISION_GROUP_DRONE,
   COLLISION_GROUP_ENEMY_PROJECTILE,
   COLLISION_GROUP_FUSION_A,
   COLLISION_GROUP_FUSION_B,
@@ -576,7 +577,6 @@ const {
 } = createDronesSystem({
   scene,
   world,
-  camera,
   playerTarget,
   getCubeMeshes: () => cubeMeshes,
   createEnemyProjectile: (...a) => createEnemyProjectileRef(...a),
@@ -1738,14 +1738,12 @@ function onProjectileCollide(ent, other, contact) {
   if (!ent || ent.dead) return;
 
   const drone = drones.find((d) => !d.dying && d.body === other);
-  if (drone && ent.state === 'enemy' && !ent.shieldStuck) {
-    killDrone(drone);
-    fuseProjectileExplode(ent);
-    return;
-  }
-  if (drone && ent.state === 'friendly' && !ent.shieldStuck) {
-    killDrone(drone);
-    fuseProjectileExplode(ent);
+  if (drone) {
+    // Solo balas aliadas (del jugador) matan drones; las enemigas los ignoran.
+    if (ent.state === 'friendly' && !ent.shieldStuck) {
+      killDrone(drone);
+      fuseProjectileExplode(ent);
+    }
     return;
   }
 
@@ -2844,6 +2842,10 @@ function animate() {
     }
   }
 
+  if (!isPaused && !isGameOver) {
+    playerTarget.position.copy(controls.object.position);
+  }
+
   if (!isPaused) {
     const shakeDecay = Math.pow(0.82, dt * 60);
     handShakeX *= shakeDecay;
@@ -2905,10 +2907,10 @@ function animate() {
   }
 
   if (!isPaused && !isGameOver) {
-    playerTarget.position.copy(camera.position);
-
     updateBulletTimeAndPhysicsScale();
-    updateDronesAI(dt);
+    if (controls.isLocked) {
+      updateDronesAI(dt);
+    }
     updateProjectileLife(dt);
     syncPlayerHitBody();
 

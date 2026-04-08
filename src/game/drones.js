@@ -2,6 +2,8 @@ import * as THREE from 'three';
 import * as CANNON from 'cannon-es';
 import {
   ARENA_HALF,
+  COLLISION_GROUP_DRONE,
+  COLLISION_MASK_DRONE,
   CUBE_KILL_DRONE_SPEED,
   DRONE_ATTACK_MAX_DIST,
   DRONE_ATTACK_MIN_DIST,
@@ -9,17 +11,10 @@ import {
   DRONE_FIRE_COOLDOWN,
   DRONE_FLASH_SEC,
   DRONE_LINEAR_DAMPING,
-  DRONE_MAX_FORCE,
   DRONE_MAX_SPEED,
   DRONE_MASS,
-  DRONE_ORBIT_ANGULAR_SPEED,
-  DRONE_PATTERN_CHASER,
-  DRONE_PATTERN_STRAFE,
   DRONE_PERSONAL_OFFSET_RANGE,
   DRONE_RADIUS,
-  DRONE_STEER_STRENGTH,
-  DRONE_STRAFE_RADIUS_MAX,
-  DRONE_STRAFE_RADIUS_MIN,
   ELITE_DRONE_MASS,
   ELITE_DRONE_RADIUS,
   ELITE_SPAWN_EVERY_NORMAL_KILLS,
@@ -28,10 +23,16 @@ import {
   SPAWN_RING_OUTER,
 } from '../config/constants.js';
 
-/** Inyecta escena/mundo/cámara y callbacks; `createEnemyProjectile` puede enlazarse tras definirse en main. */
+/** Inyecta escena/mundo/cámara y callbacks. */
 export function createDronesSystem(deps) {
-  const { scene, world, camera, playerTarget, getCubeMeshes, createEnemyProjectile, onDroneKill } =
-    deps;
+  const {
+    scene,
+    world,
+    playerTarget,
+    getCubeMeshes,
+    createEnemyProjectile,
+    onDroneKill,
+  } = deps;
 
   const droneGeo = new THREE.SphereGeometry(DRONE_RADIUS, 20, 20);
   const eliteDroneGeo = new THREE.SphereGeometry(ELITE_DRONE_RADIUS, 22, 22);
@@ -51,8 +52,9 @@ export function createDronesSystem(deps) {
     const angle = Math.random() * Math.PI * 2;
     const dist =
       SPAWN_RING_INNER + Math.random() * (SPAWN_RING_OUTER - SPAWN_RING_INNER);
-    let x = camera.position.x + Math.cos(angle) * dist;
-    let z = camera.position.z + Math.sin(angle) * dist;
+    const pt = playerTarget.position;
+    let x = pt.x + Math.cos(angle) * dist;
+    let z = pt.z + Math.sin(angle) * dist;
     const y = 0.9 + Math.random() * 5;
     const half = ARENA_HALF;
     x = THREE.MathUtils.clamp(x, -half, half);
@@ -96,14 +98,15 @@ export function createDronesSystem(deps) {
       linearDamping: elite ? DRONE_LINEAR_DAMPING * 0.88 : DRONE_LINEAR_DAMPING,
       angularDamping: 0.82,
       position: new CANNON.Vec3(x, y, z),
+      collisionFilterGroup: COLLISION_GROUP_DRONE,
+      collisionFilterMask: COLLISION_MASK_DRONE,
     });
     body.addShape(shape);
+    body.userData = { isDrone: true };
+    // Ignorar gravedad en Y: el suelo y la altura se fijan en syncDroneMeshes.
+    body.linearFactor.set(1, 0, 1);
     world.addBody(body);
 
-    const roll = Math.random();
-    const aiPattern =
-      opts.aiPattern ??
-      (roll < 0.5 ? DRONE_PATTERN_CHASER : DRONE_PATTERN_STRAFE);
     const drone = {
       mesh,
       body,
@@ -112,12 +115,7 @@ export function createDronesSystem(deps) {
       deathPhase: 0,
       personalOffset: randomPersonalOffset(),
       shootTimer: 0,
-      aiPattern,
-      orbitAngle: Math.random() * Math.PI * 2,
-      orbitDir: Math.random() < 0.5 ? 1 : -1,
-      orbitRadius:
-        DRONE_STRAFE_RADIUS_MIN +
-        Math.random() * (DRONE_STRAFE_RADIUS_MAX - DRONE_STRAFE_RADIUS_MIN),
+      aimInAttackBand: false,
     };
 
     body.addEventListener('collide', (e) => {
@@ -162,96 +160,63 @@ export function createDronesSystem(deps) {
     });
   }
 
-  const _droneToPlayer = new CANNON.Vec3();
-  const _droneForce = new CANNON.Vec3();
-  const _droneRadialXZ = new THREE.Vector3();
-
   function updateDronesAI(dt) {
-    const px = playerTarget.position.x;
-    const py = playerTarget.position.y;
-    const pz = playerTarget.position.z;
+    const pt = playerTarget.position;
+    const px = pt.x;
+    const py = pt.y;
+    const pz = pt.z;
 
     for (const d of drones) {
       if (d.dying) continue;
       const b = d.body;
-      const pattern = d.aiPattern || DRONE_PATTERN_CHASER;
+      b.wakeUp();
 
-      _droneToPlayer.set(px - b.position.x, py - b.position.y, pz - b.position.z);
-      const distToCam = _droneToPlayer.length();
+      const dxP = px - b.position.x;
+      const dyP = py - b.position.y;
+      const dzP = pz - b.position.z;
+      const distToPlayer = Math.sqrt(dxP * dxP + dyP * dyP + dzP * dzP);
       const inAttackBand =
-        distToCam >= DRONE_ATTACK_MIN_DIST && distToCam <= DRONE_ATTACK_MAX_DIST;
+        distToPlayer >= DRONE_ATTACK_MIN_DIST &&
+        distToPlayer <= DRONE_ATTACK_MAX_DIST;
+      d.aimInAttackBand = inAttackBand;
 
       if (inAttackBand) {
-        d.mesh.position.set(b.position.x, b.position.y, b.position.z);
-        d.mesh.lookAt(playerTarget.position);
         d.shootTimer += dt;
         if (d.shootTimer >= DRONE_FIRE_COOLDOWN) {
           d.shootTimer = 0;
-          createEnemyProjectile(
-            b.position.x,
-            b.position.y,
-            b.position.z,
-            playerTarget.position.x,
-            playerTarget.position.y,
-            playerTarget.position.z
-          );
-        }
-        if (pattern === DRONE_PATTERN_CHASER) {
-          continue;
+          createEnemyProjectile(b.position.x, b.position.y, b.position.z, px, py, pz);
         }
       } else {
         d.shootTimer = 0;
       }
 
-      const ox = d.personalOffset.x;
-      const oy = d.personalOffset.y;
-      const oz = d.personalOffset.z;
+      // Objetivo solo en XZ (suelo); el offset Y del spawn no se usa para perseguir en altura
+      let tx = px + d.personalOffset.x;
+      let tz = pz + d.personalOffset.z;
+      const hdx = b.position.x - px;
+      const hdz = b.position.z - pz;
+      const hDist = Math.sqrt(hdx * hdx + hdz * hdz);
+      if (hDist > 0.08 && distToPlayer < DRONE_ATTACK_MIN_DIST) {
+        const inv = 1 / hDist;
+        const ringR = DRONE_ATTACK_MIN_DIST + 2;
+        tx = px + hdx * inv * ringR;
+        tz = pz + hdz * inv * ringR;
+      }
 
-      let tx;
-      let ty;
-      let tz;
-      if (pattern === DRONE_PATTERN_STRAFE) {
-        d.orbitAngle =
-          (d.orbitAngle ?? 0) +
-          dt * DRONE_ORBIT_ANGULAR_SPEED * (d.orbitDir ?? 1);
-        const r = d.orbitRadius ?? 15;
-        const oxs = ox * 0.35;
-        const ozs = oz * 0.35;
-        tx = px + Math.cos(d.orbitAngle) * r + oxs;
-        ty = py + oy * 0.45;
-        tz = pz + Math.sin(d.orbitAngle) * r + ozs;
+      const tdx = tx - b.position.x;
+      const tdz = tz - b.position.z;
+      const distH = Math.sqrt(tdx * tdx + tdz * tdz);
+      const speed = DRONE_MAX_SPEED * (d.elite ? 1.2 : 1);
+
+      if (distH > 0.02) {
+        const inv = 1 / distH;
+        b.velocity.x = tdx * inv * speed;
+        b.velocity.z = tdz * inv * speed;
       } else {
-        tx = camera.position.x + ox;
-        ty = camera.position.y + oy;
-        tz = camera.position.z + oz;
-        _droneRadialXZ.set(b.position.x - px, 0, b.position.z - pz);
-        const rh = _droneRadialXZ.length();
-        if (rh > 0.08 && distToCam < DRONE_ATTACK_MIN_DIST) {
-          _droneRadialXZ.multiplyScalar(1 / rh);
-          const ringR = DRONE_ATTACK_MIN_DIST + 2;
-          tx = px + _droneRadialXZ.x * ringR;
-          tz = pz + _droneRadialXZ.z * ringR;
-        }
+        b.velocity.x = 0;
+        b.velocity.z = 0;
       }
-
-      _droneToPlayer.set(tx - b.position.x, ty - b.position.y, tz - b.position.z);
-      const dist = _droneToPlayer.length();
-      if (dist < 0.15) continue;
-      _droneToPlayer.scale(1 / dist, _droneToPlayer);
-      const vx = b.velocity.x;
-      const vy = b.velocity.y;
-      const vz = b.velocity.z;
-      const k = b.mass * DRONE_STEER_STRENGTH * dt * (d.elite ? 1.2 : 1);
-      _droneForce.set(
-        (_droneToPlayer.x * DRONE_MAX_SPEED - vx) * k,
-        (_droneToPlayer.y * DRONE_MAX_SPEED - vy) * k,
-        (_droneToPlayer.z * DRONE_MAX_SPEED - vz) * k
-      );
-      const fLen = _droneForce.length();
-      if (fLen > DRONE_MAX_FORCE) {
-        _droneForce.scale(DRONE_MAX_FORCE / fLen, _droneForce);
-      }
-      b.applyForce(_droneForce, b.position);
+      b.velocity.y = 0;
     }
   }
 
@@ -281,7 +246,15 @@ export function createDronesSystem(deps) {
   function syncDroneMeshes() {
     for (const d of drones) {
       if (d.dying) continue;
-      d.mesh.position.copy(d.body.position);
+      const b = d.body;
+      const r = d.elite ? ELITE_DRONE_RADIUS : DRONE_RADIUS;
+      // Plano del suelo en Y=0: centro de la esfera apoyada
+      b.position.y = r;
+      b.velocity.y = 0;
+      d.mesh.position.copy(b.position);
+      if (d.aimInAttackBand) {
+        d.mesh.lookAt(playerTarget.position);
+      }
     }
   }
 

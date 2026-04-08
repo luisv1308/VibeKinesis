@@ -28,15 +28,6 @@ export const DRONE_ATTACK_MIN_DIST = 6.5;
 export const DRONE_ATTACK_MAX_DIST = 34;
 /** No metralleta; más rápido que el 3 s del commit base. */
 export const DRONE_FIRE_COOLDOWN = 1.65;
-/** Persiguen al jugador (comportamiento clásico en banda solo disparan). */
-export const DRONE_PATTERN_CHASER = 'chaser';
-/** Rodean en órbita y disparan desde la banda. */
-export const DRONE_PATTERN_STRAFE = 'strafe';
-/** Velocidad angular en órbita (rad/s). */
-export const DRONE_ORBIT_ANGULAR_SPEED = 1.02;
-/** Radio de órbita en XZ (dentro de la banda de disparo). */
-export const DRONE_STRAFE_RADIUS_MIN = 11;
-export const DRONE_STRAFE_RADIUS_MAX = 22;
 /** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
 export const PLAYER_HIT_RADIUS = 0.64;
 
@@ -48,10 +39,10 @@ export const PROJ_SPAWN_CLEARANCE = DRONE_RADIUS + PROJ_RADIUS + 0.1;
 export const DRONE_MAX_SPEED = 8.6;
 /** Qué tan rápido alcanzan esa velocidad (steering). */
 export const DRONE_STEER_STRENGTH = 6.2;
-/** Tope de fuerza por frame para evitar tirones. */
-export const DRONE_MAX_FORCE = 20;
+/** Tope de fuerza de steering (sin contar compensación de gravedad). */
+export const DRONE_MAX_FORCE = 40;
 /** Amortiguación lineal del cuerpo (menos = más ágiles). */
-export const DRONE_LINEAR_DAMPING = 0.28;
+export const DRONE_LINEAR_DAMPING = 0.18;
 export const SPAWN_INTERVAL = 5;
 /** Anillo de aparición alrededor del jugador: radio interior / exterior. */
 export const SPAWN_RING_INNER = 22;
@@ -165,10 +156,20 @@ export const VORTEX_MAX_CAPTURED = 5;
 
 /** Proyectiles enemigos: grupo propio para no chocar entre sí. */
 export const COLLISION_GROUP_ENEMY_PROJECTILE = 2;
+/** Cuerpos de drones: las balas enemigas los ignoran (ven el flag y continúan). */
+export const COLLISION_GROUP_DRONE = 4;
+/** Balas enemigas excluyen proyectiles enemigos y cuerpos de drones. */
 export const COLLISION_MASK_ENEMY_PROJECTILE =
+  -1 ^ COLLISION_GROUP_ENEMY_PROJECTILE;
+/** Drones ignoran balas enemigas (excluyen su grupo del mask). */
+export const COLLISION_MASK_DRONE =
   -1 ^ COLLISION_GROUP_ENEMY_PROJECTILE;
 /** Hitbox del jugador: los proyectiles en telaraña dejan de colisionar con este grupo. */
 export const COLLISION_GROUP_PLAYER_BODY = 256;
+/** Distancia mínima deseada entre centros de drones (separación). */
+export const DRONE_SEPARATION_DIST = 4.0;
+/** Fuerza de repulsión entre drones cuando están demasiado juntos. */
+export const DRONE_SEPARATION_FORCE = 18;
 /**
  * Pareja en fusión magnética: filtros cruzados para que no colisionen entre sí
  * (el proyectil es muy ligero y el solver lo expulsaba del cubo cada frame).
