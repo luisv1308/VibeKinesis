@@ -95,6 +95,8 @@ export const DRONE_PACE_MOVE_MIN = 0.75;
 export const PLAYER_HIT_RADIUS = 0.64;
 
 export const DRONE_RADIUS = 0.38;
+/** Solo malla Three.js; el cuerpo físico sigue siendo la esfera DRONE_RADIUS. */
+export const DRONE_VISUAL_SCALE_MULT = 1.62;
 export const DRONE_MASS = 0.55;
 /** Evita spawnear la bala dentro del cuerpo del dron (solapamiento = empuje aleatorio del solver). */
 export const PROJ_SPAWN_CLEARANCE = DRONE_RADIUS + PROJ_RADIUS + 0.1;

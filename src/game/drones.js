@@ -56,6 +56,7 @@ import {
   DRONE_TYPE_CHASER,
   DRONE_TYPE_ORBITER,
   DRONE_TYPE_SHOOTER,
+  DRONE_VISUAL_SCALE_MULT,
   ELITE_DRONE_MASS,
   ELITE_DRONE_RADIUS,
   ELITE_SPAWN_EVERY_NORMAL_KILLS,
@@ -136,60 +137,170 @@ export function createDronesSystem(deps) {
     }
   }
 
-  /**
-   * Visual agresivo: núcleo + pinchos (sin tocar física; el cuerpo sigue siendo esfera).
-   */
-  function buildGeometricDroneVisual(coreMaterial, physicsRadius, opts = {}) {
-    const spikeCount = opts.spikeCount ?? 9;
-    const spikeMat = coreMaterial.clone();
-    spikeMat.color.multiplyScalar(0.52);
-    spikeMat.emissive.multiplyScalar(0.62);
+  /** CHASER: núcleo compacto + pinchos hacia +Z (morro al jugador con lookAt). */
+  function buildChaserVisual(coreMat, r, opts = {}) {
+    const geos = [];
+    const spikeMat = coreMat.clone();
+    spikeMat.color.multiplyScalar(0.48);
+    spikeMat.emissive.multiplyScalar(0.55);
 
     const root = new THREE.Group();
     const visualRig = new THREE.Group();
     root.add(visualRig);
 
-    const coreR = physicsRadius * 0.44;
+    const coreR = r * 0.36;
     const coreGeo = new THREE.IcosahedronGeometry(coreR, 0);
-    const coreMesh = new THREE.Mesh(coreGeo, coreMaterial);
+    geos.push(coreGeo);
+    const coreMesh = new THREE.Mesh(coreGeo, coreMat);
     coreMesh.castShadow = true;
     coreMesh.receiveShadow = true;
     visualRig.add(coreMesh);
 
-    const coneR = physicsRadius * 0.2;
-    const coneH = physicsRadius * 0.52;
+    const coneR = r * 0.17;
+    const coneH = r * 0.5;
     const coneGeo = new THREE.ConeGeometry(coneR, coneH, 5);
+    geos.push(coneGeo);
     const up = new THREE.Vector3(0, 1, 0);
     const q = new THREE.Quaternion();
     const pos = new THREE.Vector3();
-    const golden = Math.PI * (3 - Math.sqrt(5));
-
-    for (let i = 0; i < spikeCount; i++) {
-      const y = 1 - (2 * (i + 0.5)) / spikeCount;
-      const rr = Math.sqrt(Math.max(0, 1 - y * y));
-      const t = golden * (i + 0.3 * Math.sin(i * 2.1));
-      const dir = new THREE.Vector3(Math.cos(t) * rr, y, Math.sin(t) * rr).normalize();
+    const nMain = opts.elite ? 8 : 6;
+    for (let i = 0; i < nMain; i++) {
+      const ang = (i / nMain) * Math.PI * 2;
+      const spread = 0.42;
+      const dir = new THREE.Vector3(
+        Math.sin(ang) * spread,
+        (i % 3 - 1) * 0.16,
+        0.82 + (i % 2) * 0.06
+      ).normalize();
       const spike = new THREE.Mesh(coneGeo, spikeMat);
       q.setFromUnitVectors(up, dir);
       spike.quaternion.copy(q);
-      const dist = coreR * 0.72 + coneH * 0.38;
+      const dist = coreR * 0.65 + coneH * 0.36;
       pos.copy(dir).multiplyScalar(dist);
       spike.position.copy(pos);
-      spike.rotation.z += (Math.random() - 0.5) * 0.12;
+      spike.rotation.z += (i * 0.17) % 0.2 - 0.1;
+      spike.castShadow = true;
+      spike.receiveShadow = true;
+      visualRig.add(spike);
+    }
+    for (let s = 0; s < 2; s++) {
+      const dir = new THREE.Vector3(s === 0 ? 0.55 : -0.55, 0.2, 0.45).normalize();
+      const spike = new THREE.Mesh(coneGeo, spikeMat);
+      q.setFromUnitVectors(up, dir);
+      spike.quaternion.copy(q);
+      pos.copy(dir).multiplyScalar(coreR * 0.7 + coneH * 0.35);
+      spike.position.copy(pos);
       spike.castShadow = true;
       spike.receiveShadow = true;
       visualRig.add(spike);
     }
 
+    const chaserBaseTilt = 0.13;
+    visualRig.rotation.x = chaserBaseTilt;
+
     return {
       group: root,
       visualRig,
-      materials: [coreMaterial, spikeMat],
-      disposeGeometries: () => {
-        coreGeo.dispose();
-        coneGeo.dispose();
-      },
+      materials: [coreMat, spikeMat],
+      disposeGeometries: () => geos.forEach((g) => g.dispose()),
+      visualKind: 'chaser',
+      chaserBaseTilt,
+      orbitRing: null,
+      shooterBarrelRig: null,
+      shooterBarrelBaseZ: 0,
     };
+  }
+
+  /** ORBITER: toro horizontal + núcleo central (anillo giratorio en sync). */
+  function buildOrbiterVisual(coreMat, r) {
+    const geos = [];
+    const ringMat = coreMat.clone();
+    ringMat.color.multiplyScalar(0.92);
+    ringMat.emissive.multiplyScalar(0.88);
+
+    const root = new THREE.Group();
+    const visualRig = new THREE.Group();
+    root.add(visualRig);
+
+    const torusGeo = new THREE.TorusGeometry(r * 0.5, r * 0.095, 10, 28);
+    geos.push(torusGeo);
+    const orbitRing = new THREE.Mesh(torusGeo, ringMat);
+    orbitRing.rotation.x = Math.PI / 2;
+    orbitRing.castShadow = true;
+    orbitRing.receiveShadow = true;
+    visualRig.add(orbitRing);
+
+    const coreGeo = new THREE.SphereGeometry(r * 0.26, 10, 10);
+    geos.push(coreGeo);
+    const coreMesh = new THREE.Mesh(coreGeo, coreMat);
+    coreMesh.castShadow = true;
+    coreMesh.receiveShadow = true;
+    visualRig.add(coreMesh);
+
+    return {
+      group: root,
+      visualRig,
+      materials: [coreMat, ringMat],
+      disposeGeometries: () => geos.forEach((g) => g.dispose()),
+      visualKind: 'orbiter',
+      chaserBaseTilt: 0,
+      orbitRing,
+      shooterBarrelRig: null,
+      shooterBarrelBaseZ: 0,
+    };
+  }
+
+  /** SHOOTER: casco cúbico + dos cañones hacia +Z. */
+  function buildShooterVisual(coreMat, r) {
+    const geos = [];
+    const barrelMat = coreMat.clone();
+    barrelMat.color.multiplyScalar(0.58);
+    barrelMat.emissive.multiplyScalar(0.65);
+
+    const root = new THREE.Group();
+    const visualRig = new THREE.Group();
+    root.add(visualRig);
+
+    const hullGeo = new THREE.BoxGeometry(r * 1.05, r * 0.62, r * 0.82);
+    geos.push(hullGeo);
+    const hull = new THREE.Mesh(hullGeo, coreMat);
+    hull.castShadow = true;
+    hull.receiveShadow = true;
+    visualRig.add(hull);
+
+    const barrelGeo = new THREE.CylinderGeometry(r * 0.1, r * 0.085, r * 0.48, 8);
+    geos.push(barrelGeo);
+    const barrelRig = new THREE.Group();
+    const bz = r * 0.38;
+    barrelRig.position.z = bz;
+    for (let side = -1; side <= 1; side += 2) {
+      const barrel = new THREE.Mesh(barrelGeo, barrelMat);
+      barrel.rotation.x = Math.PI / 2;
+      barrel.position.set(side * r * 0.24, 0, r * 0.12);
+      barrel.castShadow = true;
+      barrel.receiveShadow = true;
+      barrelRig.add(barrel);
+    }
+    visualRig.add(barrelRig);
+
+    return {
+      group: root,
+      visualRig,
+      materials: [coreMat, barrelMat],
+      disposeGeometries: () => geos.forEach((g) => g.dispose()),
+      visualKind: 'shooter',
+      chaserBaseTilt: 0,
+      orbitRing: null,
+      shooterBarrelRig: barrelRig,
+      shooterBarrelBaseZ: bz,
+    };
+  }
+
+  function buildDroneVisualByType(behaviorType, mat, radius, opts = {}) {
+    if (opts.elite) return buildChaserVisual(mat, radius, { elite: true });
+    if (behaviorType === DRONE_TYPE_ORBITER) return buildOrbiterVisual(mat, radius);
+    if (behaviorType === DRONE_TYPE_SHOOTER) return buildShooterVisual(mat, radius);
+    return buildChaserVisual(mat, radius, opts);
   }
 
   /** Colores estilo Pac-Man: chaser rojo, orbiter cyan, shooter naranja. */
@@ -256,12 +367,11 @@ export function createDronesSystem(deps) {
     }
 
     const radius = elite ? ELITE_DRONE_RADIUS : DRONE_RADIUS;
-    const visual = buildGeometricDroneVisual(mat, radius, {
-      spikeCount: elite ? 12 : 9,
-    });
+    const visual = buildDroneVisualByType(behaviorType, mat, radius, { elite });
     const mesh = visual.group;
     mesh.position.set(x, y, z);
-    const meshBaseScale = elite ? (eliteVariant ? 1.12 : 1.05) : 1;
+    const meshBaseScale =
+      (elite ? (eliteVariant ? 1.12 : 1.05) : 1) * DRONE_VISUAL_SCALE_MULT;
     mesh.scale.setScalar(meshBaseScale);
     if (elite && !eliteVariant) {
       const shield = new THREE.Mesh(eliteShieldGeo, eliteShieldMat);
@@ -295,6 +405,11 @@ export function createDronesSystem(deps) {
       id,
       mesh,
       visualRig: visual.visualRig,
+      visualKind: visual.visualKind,
+      chaserBaseTilt: visual.chaserBaseTilt ?? 0,
+      orbitRing: visual.orbitRing,
+      shooterBarrelRig: visual.shooterBarrelRig,
+      shooterBarrelBaseZ: visual.shooterBarrelBaseZ ?? 0,
       droneMaterials: visual.materials,
       disposeDroneGeometries: visual.disposeGeometries,
       body,
@@ -945,14 +1060,44 @@ export function createDronesSystem(deps) {
         const mul = mi === 0 ? 1 : 0.78;
         m.emissiveIntensity = d.baseEmissiveIntensity * mul + emissiveBoost;
       }
+
+      if (d.orbitRing) {
+        d.orbitRing.rotation.y += 0.016;
+      }
+      if (d.shooterBarrelRig) {
+        const firing =
+          d.behaviorType === DRONE_TYPE_SHOOTER && d.aiState === 'attacking';
+        const kick = firing
+          ? 0.09 * Math.abs(Math.sin(performance.now() * 0.095))
+          : 0;
+        d.shooterBarrelRig.position.z = d.shooterBarrelBaseZ - kick;
+      }
+
+      const tilt = d.chaserBaseTilt ?? 0;
+      const vk = d.visualKind ?? 'chaser';
       if (d.aimInAttackBand) {
         d.mesh.lookAt(playerTarget.position);
-        if (d.visualRig) d.visualRig.rotation.set(0, 0, 0);
+        if (d.visualRig) {
+          if (vk === 'chaser') {
+            d.visualRig.rotation.set(tilt, 0, 0);
+          } else {
+            d.visualRig.rotation.set(0, 0, 0);
+          }
+        }
       } else if (d.visualRig) {
         d.mesh.rotation.set(0, 0, 0);
         const t = performance.now() * 0.001;
-        d.visualRig.rotation.y = t * 0.42 + d.id * 0.73;
-        d.visualRig.rotation.x = Math.sin(t * 0.55 + d.id * 0.31) * 0.075;
+        if (vk === 'orbiter') {
+          d.visualRig.rotation.y = t * 0.32 + d.id * 0.41;
+          d.visualRig.rotation.x = Math.sin(t * 0.48 + d.id) * 0.06;
+        } else if (vk === 'shooter') {
+          d.visualRig.rotation.y = t * 0.22 + d.id * 0.45;
+          d.visualRig.rotation.x = Math.sin(t * 0.4 + d.id) * 0.05;
+        } else {
+          d.visualRig.rotation.y = t * 0.42 + d.id * 0.73;
+          d.visualRig.rotation.x =
+            tilt + Math.sin(t * 0.55 + d.id * 0.31) * 0.075;
+        }
       }
     }
   }
