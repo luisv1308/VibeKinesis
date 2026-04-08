@@ -28,6 +28,23 @@ export const DRONE_ATTACK_MIN_DIST = 6.5;
 export const DRONE_ATTACK_MAX_DIST = 34;
 /** No metralleta; más rápido que el 3 s del commit base. */
 export const DRONE_FIRE_COOLDOWN = 1.65;
+
+/** Tipos de IA (arcade): más chasers, menos shooters. */
+export const DRONE_TYPE_CHASER = 'chaser';
+export const DRONE_TYPE_ORBITER = 'orbiter';
+export const DRONE_TYPE_SHOOTER = 'shooter';
+/** Ráfaga tirador: disparos seguidos y pausa larga (s). */
+export const DRONE_BURST_COUNT = 3;
+export const DRONE_BURST_SHOT_DELAY = 0.14;
+export const DRONE_BURST_RELOAD = 2.0;
+/** Tirador: velocidad y distancia preferida al jugador (XZ). */
+export const DRONE_SHOOTER_SPEED = 4.2;
+export const DRONE_SHOOTER_IDEAL_DIST = 16;
+/** Orbitador: radio y velocidad angular (rad/s). */
+export const DRONE_ORBIT_RADIUS_MIN = 10;
+export const DRONE_ORBIT_RADIUS_MAX = 15;
+export const DRONE_ORBIT_ANGULAR_SPEED = 0.88;
+
 /** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
 export const PLAYER_HIT_RADIUS = 0.64;
 
