@@ -2736,7 +2736,7 @@ window.addEventListener('keydown', (e) => {
     }
     return;
   }
-  if (e.code === 'KeyM' && !e.repeat && controls.isLocked && !isPaused) {
+  if (e.code === 'KeyE' && !e.repeat && controls.isLocked && !isPaused) {
     e.preventDefault();
     tryStartMagneticFusion();
     return;

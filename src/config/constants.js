@@ -172,7 +172,7 @@ export const MEGA_CUBE_MASS = 6;
 export const MEGA_CUBE_COLOR = 0x6a7a9e;
 /** Telaraña: vibración visual y resaltado del par (Tab). */
 export const VORTEX_JITTER_AMP = 0.024;
-/** Rosa: objetos del par que vas a fusionar (preview + animación M). */
+/** Rosa: objetos del par que vas a fusionar (preview + animación E). */
 export const FUSION_PREVIEW_GLOW = 0xff4da6;
 export const FUSION_PREVIEW_TINT = 0xffb8e0;
 export const FUSION_LINE_COLOR = 0xff66c4;
