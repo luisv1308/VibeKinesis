@@ -72,6 +72,8 @@ export function createDronesSystem(deps) {
     scene,
     world,
     playerTarget,
+    playerBody,
+    lineOfSightBlocked = () => false,
     getCubeMeshes,
     createEnemyProjectile,
     addCombatShake = () => {},
@@ -95,6 +97,33 @@ export function createDronesSystem(deps) {
   let lastPz = 0;
   let haveLastPlayer = false;
 
+  const LOS_RECHECK_SEC = 0.14;
+
+  function isLosCachedBlocked(drone, b, px, py, pz) {
+    const now = performance.now() * 0.001;
+    if (
+      drone._losCacheT == null ||
+      now - drone._losCacheT > LOS_RECHECK_SEC ||
+      drone._losCachePx !== px ||
+      drone._losCachePy !== py ||
+      drone._losCachePz !== pz
+    ) {
+      drone._losCacheT = now;
+      drone._losCachePx = px;
+      drone._losCachePy = py;
+      drone._losCachePz = pz;
+      drone._losCacheBlocked = lineOfSightBlocked(
+        b.position.x,
+        b.position.y,
+        b.position.z,
+        px,
+        py,
+        pz
+      );
+    }
+    return drone._losCacheBlocked;
+  }
+
   function isShotBlocked(drone, b, px, py, pz) {
     const mx = (b.position.x + px) * 0.5;
     const mz = (b.position.z + pz) * 0.5;
@@ -106,6 +135,7 @@ export function createDronesSystem(deps) {
       const dz = oz - mz;
       if (dx * dx + dz * dz < 6.25) return true;
     }
+    if (isLosCachedBlocked(drone, b, px, py, pz)) return true;
     return false;
   }
 
@@ -493,6 +523,21 @@ export function createDronesSystem(deps) {
     });
   }
 
+  /** Elimina todos los drones sin puntuación ni callbacks (cambio de modo / reset de arena). */
+  function purgeAllDrones() {
+    for (const d of [...drones]) {
+      if (d.dying) continue;
+      d.dying = true;
+      d.deathPhase = 0;
+      world.removeBody(d.body);
+      for (const m of d.droneMaterials) {
+        m.emissive.setHex(0xff6666);
+        m.emissiveIntensity = 5;
+        m.color.setHex(0xffffff);
+      }
+    }
+  }
+
   function updateDronesAI(dt) {
     const pt = playerTarget.position;
     const px = pt.x;
@@ -589,8 +634,10 @@ export function createDronesSystem(deps) {
       attackAllowed.add(x.d);
     }
 
-    const fireBasic = (b) =>
+    const fireBasic = (d, b) => {
+      if (isShotBlocked(d, b, px, py, pz)) return;
       createEnemyProjectile(b.position.x, b.position.y, b.position.z, px, py, pz);
+    };
 
     const fireShooter = (drone, b) => {
       if (!attackAllowed.has(drone)) return;
@@ -629,7 +676,7 @@ export function createDronesSystem(deps) {
           d.shootTimer += dt;
           if (d.shootTimer >= DRONE_FIRE_COOLDOWN) {
             d.shootTimer = 0;
-            fireBasic(b);
+            fireBasic(d, b);
           }
         } else {
           d.shootTimer = 0;
@@ -663,19 +710,21 @@ export function createDronesSystem(deps) {
           } else if (d.eliteAiState === 'telegraph') {
             d.telegraphTimer -= dt;
             if (d.telegraphTimer <= 0) {
-              createEnemyProjectile(
-                b.position.x,
-                b.position.y,
-                b.position.z,
-                px,
-                py,
-                pz,
-                {
-                  speedMult: DRONE_ELITE_SNIPER_SHOT_SPEED_MULT,
-                  jitter: 0.03,
-                }
-              );
-              addCombatShake(0.5);
+              if (!isShotBlocked(d, b, px, py, pz)) {
+                createEnemyProjectile(
+                  b.position.x,
+                  b.position.y,
+                  b.position.z,
+                  px,
+                  py,
+                  pz,
+                  {
+                    speedMult: DRONE_ELITE_SNIPER_SHOT_SPEED_MULT,
+                    jitter: 0.03,
+                  }
+                );
+                addCombatShake(0.5);
+              }
               d.eliteAiState = 'cooldown';
               d.eliteStateTimer = DRONE_ELITE_SNIPER_COOLDOWN;
             }
@@ -692,19 +741,21 @@ export function createDronesSystem(deps) {
           } else if (d.eliteAiState === 'telegraph') {
             d.telegraphTimer -= dt;
             if (d.telegraphTimer <= 0) {
-              const ox0 = b.position.x;
-              const oy0 = b.position.y;
-              const oz0 = b.position.z;
-              const n = DRONE_ELITE_BURST_RAYS;
-              for (let k = 0; k < n; k++) {
-                const ang = (k / n) * Math.PI * 2;
-                const txb = ox0 + Math.cos(ang) * 12;
-                const tzb = oz0 + Math.sin(ang) * 12;
-                createEnemyProjectile(ox0, oy0, oz0, txb, py, tzb, {
-                  speedMult: DRONE_ELITE_BURST_SPEED_MULT,
-                });
+              if (!isShotBlocked(d, b, px, py, pz)) {
+                const ox0 = b.position.x;
+                const oy0 = b.position.y;
+                const oz0 = b.position.z;
+                const n = DRONE_ELITE_BURST_RAYS;
+                for (let k = 0; k < n; k++) {
+                  const ang = (k / n) * Math.PI * 2;
+                  const txb = ox0 + Math.cos(ang) * 12;
+                  const tzb = oz0 + Math.sin(ang) * 12;
+                  createEnemyProjectile(ox0, oy0, oz0, txb, py, tzb, {
+                    speedMult: DRONE_ELITE_BURST_SPEED_MULT,
+                  });
+                }
+                addCombatShake(0.65);
               }
-              addCombatShake(0.65);
               d.eliteAiState = 'cooldown';
               d.eliteStateTimer = DRONE_ELITE_SNIPER_COOLDOWN;
             }
@@ -1154,6 +1205,7 @@ export function createDronesSystem(deps) {
     createDrone,
     createEliteDrone,
     killDrone,
+    purgeAllDrones,
     updateDronesAI,
     updateDronesDeath,
     syncDroneMeshes,

@@ -116,6 +116,17 @@ export const DRONE_PACE_MOVE_MIN = 0.75;
 
 /** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
 export const PLAYER_HIT_RADIUS = 0.64;
+/** Escalón automático (sube bordes bajos al caminar). */
+export const PLAYER_STEP_HEIGHT = 0.38;
+export const PLAYER_STEP_BOOST_VELOCITY = 3.15;
+export const PLAYER_STEP_PROBE = 0.42;
+/**
+ * Tope de desplazamiento horizontal por fotograma (m). Con dt alto o sprint, evita
+ * “teletransporte” XZ que pierde contacto con rampas y falla el snap al suelo.
+ */
+export const PLAYER_MAX_HORIZ_DISPLACE_PER_FRAME = 0.24;
+/** Radio del cilindro central de la cápsula (× hit). */
+export const PLAYER_CAPSULE_RADIUS_MULT = 0.92;
 
 export const DRONE_RADIUS = 0.38;
 /** Solo malla Three.js; el cuerpo físico sigue siendo la esfera DRONE_RADIUS. */
@@ -212,6 +223,8 @@ export const FUSION_PREVIEW_INTENSITY_PROJ = 2.65;
 export const ARENA_HALF = 58;
 /** Modo misión: arena más grande (sin sensación de “habitación” pequeña). */
 export const MISSION_ARENA_HALF = 168;
+/** Enemigos iniciales repartidos por el mapa (modo misión). */
+export const MISSION_PATROL_DRONE_COUNT = 14;
 export const ARENA_Y_MIN = -2;
 export const ARENA_Y_MAX = 80;
 /** Límites físicos del arena (paredes; más gruesas = menos tunelado a alta velocidad). */

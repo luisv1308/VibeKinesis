@@ -183,6 +183,26 @@
         color: #9cf0ff;
         font-size: 13px;
       }
+      #hudMission {
+        color: #b8e0ff;
+        font-size: 13px;
+        letter-spacing: 0.04em;
+      }
+      #minimapWrap {
+        position: fixed;
+        bottom: 16px;
+        left: 16px;
+        z-index: 5;
+        pointer-events: none;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 2px 14px rgba(0, 0, 0, 0.5);
+        border: 1px solid rgba(120, 180, 255, 0.4);
+      }
+      #minimapCanvas {
+        display: block;
+        vertical-align: top;
+      }
       #waveBanner,
       #wavePrepare {
         position: fixed;
@@ -252,12 +272,24 @@
     </style>
   </head>
   <body>
+    <div id="minimapWrap" style="display: none" aria-hidden="true">
+      <canvas id="minimapCanvas" width="140" height="140" role="img" aria-label="Minimapa y brújula"></canvas>
+    </div>
     <div id="gameHud" aria-live="polite">
       <div class="hud-row" id="hudScore">Puntos: 0</div>
       <div class="hud-row" id="hudCombo">Combo ×1.00</div>
       <div class="hud-row" id="hudKills">Derrotados: 0</div>
       <div class="hud-row" id="hudTime">00:00</div>
       <div class="hud-row" id="hudWave">Ola 1</div>
+      <div class="hud-row" id="hudMission" style="display: none" aria-hidden="true">
+        Misión
+      </div>
+      <div
+        class="hud-row"
+        id="hudObjective"
+        style="display: none; color: #9ee8c0; font-size: 12px"
+        aria-hidden="true"
+      ></div>
       <div class="hud-row" id="hudLives">♥♥♥</div>
       <div id="hudStaminaWrap" aria-hidden="true">
         <div id="hudStaminaBar"><div id="hudStaminaFill"></div></div>

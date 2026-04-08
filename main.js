@@ -5,19 +5,15 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import * as CANNON from 'cannon-es';
 import { createDronesSystem } from './src/game/drones.js';
+import { createMissionTurretSystem } from './src/game/missionTurrets.js';
 import {
   ARENA_HALF,
   MISSION_ARENA_HALF,
+  MISSION_PATROL_DRONE_COUNT,
   ARENA_WALL_HALF_THICK,
   ARENA_WALL_HEIGHT,
   ARENA_Y_MAX,
   ARENA_Y_MIN,
-  BUBBLE_GROUND_RESTITUTION,
-  BUBBLE_MAX_SPEED,
-  BUBBLE_MIN_SPEED,
-  BUBBLE_RANDOM_IMPULSE,
-  BUBBLE_SPEED_RETENTION,
-  BUBBLE_WALL_RESTITUTION,
   BULLET_TIME_NEAR_DIST,
   BULLET_TIME_SCALE,
   COLLISION_GROUP_DRONE,
@@ -76,7 +72,11 @@ import {
   PLASMA_VISUAL_GROW_PER_TIER,
   PLAYER_EYE_HEIGHT,
   PLAYER_HIT_RADIUS,
-  PROJ_BUBBLE_MAX_LIFE,
+  PLAYER_STEP_HEIGHT,
+  PLAYER_STEP_BOOST_VELOCITY,
+  PLAYER_STEP_PROBE,
+  PLAYER_MAX_HORIZ_DISPLACE_PER_FRAME,
+  PLAYER_CAPSULE_RADIUS_MULT,
   PROJ_ENEMY_SPEED,
   PROJ_FRIENDLY_STRAIGHT_MAX_PATH,
   PROJ_GRAVITY_BLEND_Y,
@@ -122,6 +122,83 @@ import {
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -28, 0) });
 world.allowSleep = true;
 world.broadphase = new CANNON.SAPBroadphase(world);
+/** Fricción/rebote por defecto (suelo, muros); el jugador usa un par específico para no patinar. */
+world.defaultContactMaterial.friction = 0.42;
+world.defaultContactMaterial.restitution = 0.02;
+const playerPhysicsMaterial = new CANNON.Material('player');
+const worldStaticPhysicsMaterial = new CANNON.Material('worldStatic');
+world.addContactMaterial(
+  new CANNON.ContactMaterial(playerPhysicsMaterial, worldStaticPhysicsMaterial, {
+    friction: 0.38,
+    restitution: 0.04,
+  })
+);
+world.addContactMaterial(
+  new CANNON.ContactMaterial(playerPhysicsMaterial, world.defaultMaterial, {
+    friction: 0.4,
+    restitution: 0.03,
+  })
+);
+const projectilePhysicsMaterial = new CANNON.Material('projectile');
+projectilePhysicsMaterial.restitution = 0;
+world.addContactMaterial(
+  new CANNON.ContactMaterial(projectilePhysicsMaterial, worldStaticPhysicsMaterial, {
+    friction: 0.06,
+    restitution: 0,
+  })
+);
+world.addContactMaterial(
+  new CANNON.ContactMaterial(projectilePhysicsMaterial, world.defaultMaterial, {
+    friction: 0.06,
+    restitution: 0,
+  })
+);
+
+/** Registro de pares { body, mesh? } añadidos al mundo (depuración y extensión). */
+const physicsObjectRegistry = [];
+
+function registerPhysicsObject(entry) {
+  if (!entry?.body) return;
+  physicsObjectRegistry.push(entry);
+}
+
+/**
+ * Rampa física: caja estática inclinada (masa 0). `size` = dimensiones completas del box antes de rotar.
+ * @param {THREE.Vector3} position Centro mundial
+ * @param {THREE.Euler | THREE.Quaternion} rotation
+ * @param {THREE.Vector3} size Anchura (x), grosor (y), largo (z) del prisma
+ * @returns {{ body: import('cannon-es').Body, mesh: null }}
+ */
+function createPhysicsRamp(position, rotation, size) {
+  const hx = size.x * 0.5;
+  const hy = size.y * 0.5;
+  const hz = size.z * 0.5;
+  const shape = new CANNON.Box(new CANNON.Vec3(hx, hy, hz));
+  const body = new CANNON.Body({ mass: 0 });
+  body.addShape(shape);
+  body.position.set(position.x, position.y, position.z);
+  const q =
+    rotation instanceof THREE.Quaternion
+      ? rotation
+      : new THREE.Quaternion().setFromEuler(rotation);
+  body.quaternion.set(q.x, q.y, q.z, q.w);
+  body.material = worldStaticPhysicsMaterial;
+  body.userData = { isPhysicsRamp: true, ground: true };
+  world.addBody(body);
+  registerPhysicsObject({ body, mesh: null, kind: 'physicsRamp' });
+  return { body, mesh: null };
+}
+
+/** Alias: rampa invisible (solo cuerpo Cannon, sin malla) para cubrir escaleras. */
+function createInvisibleRamp(position, rotation, size) {
+  return createPhysicsRamp(position, rotation, size);
+}
+
+if (typeof window !== 'undefined') {
+  window.createPhysicsRamp = createPhysicsRamp;
+  window.createInvisibleRamp = createInvisibleRamp;
+  window.registerPhysicsObject = registerPhysicsObject;
+}
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0c0c14);
@@ -369,6 +446,7 @@ function updateHudLayout() {
 
 updateHudLayout();
 
+/** La cámara (PointerLock) no lleva física propia: el hitbox del jugador es un cuerpo Cannon aparte (cápsula estática). */
 const controls = new PointerLockControls(camera, document.body);
 
 const blocker = document.getElementById('blocker');
@@ -388,6 +466,11 @@ let damageFlashTimer = 0;
 const hudKillsEl = document.getElementById('hudKills');
 const hudTimeEl = document.getElementById('hudTime');
 const hudWaveEl = document.getElementById('hudWave');
+const hudMissionEl = document.getElementById('hudMission');
+const hudObjectiveEl = document.getElementById('hudObjective');
+const minimapWrap = document.getElementById('minimapWrap');
+const minimapCanvas = document.getElementById('minimapCanvas');
+const minimapCtx = minimapCanvas?.getContext('2d');
 const hudLivesEl = document.getElementById('hudLives');
 const hudScoreEl = document.getElementById('hudScore');
 const hudComboEl = document.getElementById('hudCombo');
@@ -412,6 +495,29 @@ const waveState = {
 let tryWaveEndCheck = () => {};
 /** Solo normales: cada N derrotados aparece un élite. */
 let normalKillsForElite = 0;
+/** Asignado tras `createDronesSystem` (purge al cambiar de modo). */
+let purgeAllDrones = () => {};
+let waveSystemBootstrapped = false;
+let missionSystemBootstrapped = false;
+let missionCompleteShown = false;
+/** Torretas misión (asignado tras init de proyectiles). */
+let missionTurretSystem = {
+  clearAll() {},
+  update() {},
+  aliveCount() {
+    return 0;
+  },
+  spawnMissionTurret() {},
+  damageTurret() {},
+};
+function resetWaveState() {
+  waveState.currentWave = 0;
+  waveState.enemiesRemainingInWave = 0;
+  waveState.isWaveActive = false;
+  waveState.isBetweenWaves = false;
+  waveState.waveStartTime = 0;
+  waveState.betweenTimer = 0;
+}
 let gameTimeSec = 0;
 let playerLives = 3;
 let gameScore = 0;
@@ -427,6 +533,95 @@ function formatTimeMMSS(totalSec) {
   const m = Math.floor(s / 60);
   const r = s % 60;
   return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
+}
+
+const missionObjectiveState = {
+  state: 'idle',
+  mesh: null,
+  pickup: new THREE.Vector3(-48, 0.92, 62),
+  extract: new THREE.Vector3(92, 1.1, -88),
+  pickupR: 3.2,
+  extractR: 5.2,
+};
+
+function getMissionObjectiveHudText() {
+  if (gameMode !== 'mission') return '';
+  switch (missionObjectiveState.state) {
+    case 'idle':
+      return 'Objetivo: recoger paquete (E)';
+    case 'carried':
+      return 'Objetivo: llevar a extracción (E)';
+    case 'delivered':
+      return 'Paquete entregado';
+    default:
+      return '';
+  }
+}
+
+function clearMissionObjectiveEntity() {
+  if (missionObjectiveState.mesh) {
+    camera.remove(missionObjectiveState.mesh);
+    scene.remove(missionObjectiveState.mesh);
+    missionObjectiveState.mesh.geometry?.dispose();
+    missionObjectiveState.mesh.material?.dispose();
+  }
+  missionObjectiveState.mesh = null;
+  missionObjectiveState.state = 'idle';
+}
+
+function buildMissionObjectiveEntity() {
+  clearMissionObjectiveEntity();
+  const g = new THREE.BoxGeometry(0.42, 0.3, 0.55);
+  const m = new THREE.MeshStandardMaterial({
+    color: 0xff9933,
+    emissive: 0x331800,
+    emissiveIntensity: 0.85,
+    metalness: 0.28,
+    roughness: 0.42,
+  });
+  const mesh = new THREE.Mesh(g, m);
+  mesh.castShadow = true;
+  mesh.position.copy(missionObjectiveState.pickup);
+  scene.add(mesh);
+  missionObjectiveState.mesh = mesh;
+}
+
+/** @returns {boolean} true si E consumió la interacción (no fusionar en el mismo frame). */
+function tryMissionObjectiveInteractMaybe() {
+  if (!missionObjectiveState.mesh || missionCompleteShown) return false;
+  const p = camera.position;
+  const m = missionObjectiveState.mesh;
+  if (missionObjectiveState.state === 'idle') {
+    const d = Math.hypot(
+      m.position.x - p.x,
+      m.position.z - p.z
+    );
+    if (d < missionObjectiveState.pickupR) {
+      missionObjectiveState.state = 'carried';
+      scene.remove(m);
+      m.position.set(0.42, -0.22, -0.52);
+      camera.add(m);
+      updateGameHud();
+      return true;
+    }
+  } else if (missionObjectiveState.state === 'carried') {
+    const ex = missionObjectiveState.extract.x;
+    const ez = missionObjectiveState.extract.z;
+    const d = Math.hypot(p.x - ex, p.z - ez);
+    if (d < missionObjectiveState.extractR) {
+      missionObjectiveState.state = 'delivered';
+      camera.remove(m);
+      m.position.set(
+        ex,
+        missionObjectiveState.extract.y,
+        ez
+      );
+      scene.add(m);
+      updateGameHud();
+      return true;
+    }
+  }
+  return false;
 }
 
 function updateGameHud() {
@@ -452,6 +647,30 @@ function updateGameHud() {
   }
   if (hudLivesEl) {
     hudLivesEl.textContent = '♥'.repeat(Math.max(0, playerLives));
+  }
+  if (hudMissionEl) {
+    if (gameMode === 'mission') {
+      hudMissionEl.style.display = '';
+      hudMissionEl.setAttribute('aria-hidden', 'false');
+      if (!missionSystemBootstrapped) {
+        hudMissionEl.textContent = 'Misión: patrullas';
+      } else {
+        const alive =
+          drones.filter((d) => !d.dying).length +
+          missionTurretSystem.aliveCount();
+        hudMissionEl.textContent = `Hostiles: ${alive}`;
+      }
+      if (hudObjectiveEl) {
+        hudObjectiveEl.textContent = getMissionObjectiveHudText();
+        hudObjectiveEl.style.display = '';
+      }
+    } else {
+      hudMissionEl.style.display = 'none';
+      hudMissionEl.setAttribute('aria-hidden', 'true');
+    }
+  }
+  if (hudObjectiveEl && gameMode !== 'mission') {
+    hudObjectiveEl.style.display = 'none';
   }
 }
 
@@ -516,7 +735,7 @@ function applyBlockerCopyForMode() {
           P: pausa (no aparecen enemigos ni avanza la física).`;
   if (gameMode === 'mission') {
     blockerHeadingEl.textContent = 'Clic para jugar · Modo misión';
-    blockerInstructionsEl.innerHTML = `Mapa amplio con estructuras interiores; sin oleadas automáticas (objetivos de misión en desarrollo). ${common}`;
+    blockerInstructionsEl.innerHTML = `Elimina a todas las patrullas del sector. Mapa amplio con estructuras interiores. ${common}`;
   } else {
     blockerHeadingEl.textContent = 'Clic para jugar · Modo olas';
     blockerInstructionsEl.innerHTML = common;
@@ -659,7 +878,10 @@ const groundShape = new CANNON.Plane();
 const groundBody = new CANNON.Body({ mass: 0 });
 groundBody.addShape(groundShape);
 groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+groundBody.material = worldStaticPhysicsMaterial;
+groundBody.userData = { ground: true };
 world.addBody(groundBody);
+registerPhysicsObject({ body: groundBody, mesh: groundMesh, kind: 'ground' });
 
 const arenaWallEntries = [];
 const missionInteriorEntries = [];
@@ -686,12 +908,57 @@ const arenaOuterWallMat = new THREE.MeshStandardMaterial({
   emissiveIntensity: 0.22,
 });
 const missionInteriorWallMat = new THREE.MeshStandardMaterial({
-  color: 0x2a3548,
-  roughness: 0.9,
-  metalness: 0.1,
-  emissive: 0x0a1118,
-  emissiveIntensity: 0.2,
+  color: 0x3d4d63,
+  roughness: 0.88,
+  metalness: 0.12,
+  emissive: 0x101a28,
+  emissiveIntensity: 0.24,
 });
+const missionPillarMat = new THREE.MeshStandardMaterial({
+  color: 0x4a5c78,
+  roughness: 0.82,
+  metalness: 0.18,
+  emissive: 0x0c1420,
+  emissiveIntensity: 0.18,
+});
+const missionDeckMat = new THREE.MeshStandardMaterial({
+  color: 0x5a6d88,
+  roughness: 0.78,
+  metalness: 0.22,
+  emissive: 0x182030,
+  emissiveIntensity: 0.15,
+});
+const missionRampMat = new THREE.MeshStandardMaterial({
+  color: 0x4a5c70,
+  roughness: 0.85,
+  metalness: 0.15,
+  emissive: 0x101820,
+  emissiveIntensity: 0.12,
+});
+
+/** Suelos pisables (altura Y del pie); solo misión — vacío en olas = suelo 0. */
+const walkableFootSurfaces = [];
+/** Rampas en Z con altura lineal (y0→y1) para subir sin perder el suelo lógico entre peldaños. */
+const rampSlopeWalkables = [];
+/** Muros destruibles (misión). */
+const destructibleWallEntries = [];
+
+/** Rejilla y props solo visuales (modo misión). */
+const missionVisualExtras = [];
+
+function disposeMissionExtraObject(obj) {
+  scene.remove(obj);
+  obj.traverse((ch) => {
+    if (ch.geometry) ch.geometry.dispose();
+  });
+}
+
+function clearMissionVisualExtras() {
+  for (const o of missionVisualExtras) {
+    disposeMissionExtraObject(o);
+  }
+  missionVisualExtras.length = 0;
+}
 
 function clearArenaWalls() {
   for (const e of arenaWallEntries) {
@@ -703,6 +970,12 @@ function clearArenaWalls() {
 }
 
 function clearMissionInterior() {
+  walkableFootSurfaces.length = 0;
+  rampSlopeWalkables.length = 0;
+  destructibleWallEntries.length = 0;
+  missionTurretSystem.clearAll();
+  clearMissionObjectiveEntity();
+  clearMissionVisualExtras();
   for (const e of missionInteriorEntries) {
     world.removeBody(e.body);
     scene.remove(e.mesh);
@@ -721,7 +994,8 @@ function addArenaOuterWalls(half) {
     const body = new CANNON.Body({ mass: 0 });
     body.addShape(shape);
     body.position.set(cx, cy, cz);
-    body.userData = { isArenaWall: true };
+    body.material = worldStaticPhysicsMaterial;
+    body.userData = { isArenaWall: true, wall: true };
     world.addBody(body);
     const mesh = new THREE.Mesh(
       new THREE.BoxGeometry(hx * 2, hy * 2, hz * 2),
@@ -732,6 +1006,7 @@ function addArenaOuterWalls(half) {
     mesh.receiveShadow = true;
     scene.add(mesh);
     arenaWallEntries.push({ body, mesh });
+    registerPhysicsObject({ body, mesh, kind: 'arenaOuter' });
   };
   addWall(half + T, yc, 0, T, H * 0.5, half + T);
   addWall(-half - T, yc, 0, T, H * 0.5, half + T);
@@ -739,31 +1014,267 @@ function addArenaOuterWalls(half) {
   addWall(0, yc, -half - T, half + T, H * 0.5, T);
 }
 
+function addVerticalBlock(cx, cy, cz, halfW, halfH, halfD, mat = missionInteriorWallMat) {
+  const shape = new CANNON.Box(new CANNON.Vec3(halfW, halfH, halfD));
+  const body = new CANNON.Body({ mass: 0 });
+  body.addShape(shape);
+  body.position.set(cx, cy, cz);
+  body.material = worldStaticPhysicsMaterial;
+  body.userData = { isMazeWall: true, wall: true };
+  world.addBody(body);
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(halfW * 2, halfH * 2, halfD * 2),
+    mat
+  );
+  mesh.position.set(cx, cy, cz);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  mazeWallColliders.push({
+    minX: cx - halfW,
+    maxX: cx + halfW,
+    minZ: cz - halfD,
+    maxZ: cz + halfD,
+  });
+  missionInteriorEntries.push({ body, mesh });
+  registerPhysicsObject({ body, mesh, kind: 'missionWall' });
+}
+
+function addDestructibleWall(cx, cy, cz, halfW, halfH, halfD) {
+  const shape = new CANNON.Box(new CANNON.Vec3(halfW, halfH, halfD));
+  const body = new CANNON.Body({ mass: 0 });
+  body.addShape(shape);
+  body.position.set(cx, cy, cz);
+  body.material = worldStaticPhysicsMaterial;
+  const collider = {
+    minX: cx - halfW,
+    maxX: cx + halfW,
+    minZ: cz - halfD,
+    maxZ: cz + halfD,
+  };
+  mazeWallColliders.push(collider);
+  const mat = missionInteriorWallMat.clone();
+  mat.color.setHex(0x5c4a72);
+  mat.emissive.setHex(0x241838);
+  mat.emissiveIntensity = 0.5;
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(halfW * 2, halfH * 2, halfD * 2),
+    mat
+  );
+  mesh.position.set(cx, cy, cz);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  const entry = { body, mesh, collider, hp: 4 };
+  body.userData = {
+    isMazeWall: true,
+    wall: true,
+    destructibleWallEntry: entry,
+  };
+  world.addBody(body);
+  missionInteriorEntries.push({ body, mesh });
+  destructibleWallEntries.push(entry);
+  registerPhysicsObject({ body, mesh, kind: 'destructibleWall' });
+}
+
+function destroyDestructibleWallEntry(entry) {
+  if (!entry?.body) return;
+  world.removeBody(entry.body);
+  scene.remove(entry.mesh);
+  entry.mesh.geometry.dispose();
+  if (entry.mesh.material?.dispose) entry.mesh.material.dispose();
+  const ci = mazeWallColliders.indexOf(entry.collider);
+  if (ci >= 0) mazeWallColliders.splice(ci, 1);
+  const mi = missionInteriorEntries.findIndex((e) => e.body === entry.body);
+  if (mi >= 0) missionInteriorEntries.splice(mi, 1);
+  const di = destructibleWallEntries.indexOf(entry);
+  if (di >= 0) destructibleWallEntries.splice(di, 1);
+}
+
+/** Altura de suelo bajo los pies (la más alta por debajo de feetY). */
+function getSupportingGroundY(x, z, feetY) {
+  let best = 0;
+  for (const p of walkableFootSurfaces) {
+    if (x < p.minX || x > p.maxX || z < p.minZ || z > p.maxZ) continue;
+    if (p.topY <= feetY + 0.28 && p.topY > best) best = p.topY;
+  }
+  const zMinMax = (z0, z1) => {
+    const lo = Math.min(z0, z1);
+    const hi = Math.max(z0, z1);
+    return { lo, hi };
+  };
+  for (const r of rampSlopeWalkables) {
+    if (x < r.minX || x > r.maxX) continue;
+    const { lo, hi } = zMinMax(r.z0, r.z1);
+    if (z < lo || z > hi) continue;
+    const span = r.z1 - r.z0;
+    const t = Math.abs(span) < 1e-8 ? 0 : (z - r.z0) / span;
+    const topY = r.y0 + t * (r.y1 - r.y0);
+    // Ventana amplia: al subir rápido los pies van ligeramente por debajo de la superficie
+    // analítica de la rampa; si es demasiado estrecha, getSupportingGroundY devuelve el
+    // suelo bajo y el jugador “cae” del plano inclinado.
+    if (topY <= feetY + 0.9 && topY > best) best = topY;
+  }
+  return best;
+}
+
+function registerZRampSlope(minX, maxX, z0, z1, y0, y1) {
+  rampSlopeWalkables.push({ minX, maxX, z0, z1, y0, y1 });
+}
+
+function addWalkableDeck(cx, cz, hw, hd, deckClearY, deckThick) {
+  const cy = deckClearY + deckThick * 0.5;
+  const hhy = deckThick * 0.5;
+  const shape = new CANNON.Box(new CANNON.Vec3(hw, hhy, hd));
+  const body = new CANNON.Body({ mass: 0 });
+  body.addShape(shape);
+  body.position.set(cx, cy, cz);
+  body.material = worldStaticPhysicsMaterial;
+  body.userData = { isWalkableDeck: true, ground: true };
+  world.addBody(body);
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(hw * 2, deckThick, hd * 2),
+    missionDeckMat
+  );
+  mesh.position.set(cx, cy, cz);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  missionInteriorEntries.push({ body, mesh });
+  registerPhysicsObject({ body, mesh, kind: 'walkableDeck' });
+  walkableFootSurfaces.push({
+    minX: cx - hw,
+    maxX: cx + hw,
+    minZ: cz - hd,
+    maxZ: cz + hd,
+    topY: deckClearY + deckThick,
+  });
+}
+
+function addWalkableRampStep(cx, cy, cz, halfW, halfH, halfD, topY, mat) {
+  const shape = new CANNON.Box(new CANNON.Vec3(halfW, halfH, halfD));
+  const body = new CANNON.Body({ mass: 0 });
+  body.addShape(shape);
+  body.position.set(cx, cy, cz);
+  body.material = worldStaticPhysicsMaterial;
+  body.userData = { isRampStep: true, ground: true };
+  world.addBody(body);
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(halfW * 2, halfH * 2, halfD * 2),
+    mat
+  );
+  mesh.position.set(cx, cy, cz);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  missionInteriorEntries.push({ body, mesh });
+  registerPhysicsObject({ body, mesh, kind: 'rampStep' });
+  walkableFootSurfaces.push({
+    minX: cx - halfW,
+    maxX: cx + halfW,
+    minZ: cz - halfD,
+    maxZ: cz + halfD,
+    topY,
+  });
+}
+
+function addRampAlongZ(cx, cz, halfW, z0, z1, y0, y1, numSteps) {
+  for (let i = 0; i < numSteps; i++) {
+    const u0 = i / numSteps;
+    const u1 = (i + 1) / numSteps;
+    const zA = z0 + (z1 - z0) * u0;
+    const zB = z0 + (z1 - z0) * u1;
+    const yA = y0 + (y1 - y0) * u0;
+    const yB = y0 + (y1 - y0) * u1;
+    const zMid = (zA + zB) * 0.5;
+    const hz = Math.max(0.06, (zB - zA) * 0.5);
+    const cy = (yA + yB) * 0.5;
+    const hhy = Math.max(0.04, (yB - yA) * 0.5);
+    addWalkableRampStep(cx, cy, zMid, halfW, hhy, hz, yB, missionRampMat);
+  }
+}
+
+/** Solo mallas visuales (sin cuerpos Cannon) para escaleras; la subida es la rampa invisible. */
+function addVisualRampStepsAlongZ(cx, cz, halfW, z0, z1, y0, y1, numSteps) {
+  for (let i = 0; i < numSteps; i++) {
+    const u0 = i / numSteps;
+    const u1 = (i + 1) / numSteps;
+    const zA = z0 + (z1 - z0) * u0;
+    const zB = z0 + (z1 - z0) * u1;
+    const yA = y0 + (y1 - y0) * u0;
+    const yB = y0 + (y1 - y0) * u1;
+    const zMid = (zA + zB) * 0.5;
+    const hz = Math.max(0.06, (zB - zA) * 0.5);
+    const cy = (yA + yB) * 0.5;
+    const hhy = Math.max(0.04, (yB - yA) * 0.5);
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(halfW * 2, hhy * 2, hz * 2),
+      missionRampMat
+    );
+    mesh.position.set(cx, cy, zMid);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    missionVisualExtras.push(mesh);
+  }
+}
+
+function addRampSouthOfPlatform(cx, cz, hw, hd, surfaceY) {
+  const rampLen = 7.5;
+  const rampHalfW = Math.min(2.4, hw * 0.55);
+  const z0 = cz - hd - rampLen;
+  const z1 = cz - hd - 0.1;
+  const run = z1 - z0;
+  const rise = surfaceY;
+  const angle = Math.atan2(rise, run);
+  const midZ = (z0 + z1) * 0.5;
+  const midY = rise * 0.5;
+  const slopeLen = Math.hypot(run, rise) + 0.25;
+  createInvisibleRamp(
+    new THREE.Vector3(cx, midY, midZ),
+    new THREE.Euler(-angle, 0, 0, 'XYZ'),
+    new THREE.Vector3(rampHalfW * 2, 0.24, slopeLen)
+  );
+  registerZRampSlope(cx - rampHalfW, cx + rampHalfW, z0, z1, 0, surfaceY);
+  addVisualRampStepsAlongZ(cx, cz, rampHalfW, z0, z1, 0, surfaceY, 22);
+}
+
+/**
+ * Plataforma elevada: pilares + cubierta con física y suelo caminable + rampa sur.
+ */
+function addElevatedPlatform(cx, cz, hw, hd, deckClearY) {
+  const deckThick = 0.16;
+  const pillarTop = deckClearY;
+  const pillarHalfH = pillarTop * 0.5;
+  const py = pillarHalfH;
+  const inset = 0.9;
+  const px = Math.max(0.5, hw - inset);
+  const pz = Math.max(0.5, hd - inset);
+  const ph = 0.68;
+  const pd = 0.68;
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      addVerticalBlock(
+        cx + sx * px,
+        py,
+        cz + sz * pz,
+        ph,
+        pillarHalfH,
+        pd,
+        missionPillarMat
+      );
+    }
+  }
+  const surfaceY = deckClearY + deckThick;
+  addWalkableDeck(cx, cz, hw, hd, deckClearY, deckThick);
+  addRampSouthOfPlatform(cx, cz, hw, hd, surfaceY);
+}
+
 function buildMissionInterior() {
   const halfH = 2.25;
   const y0 = halfH;
   const addSeg = (cx, cz, halfW, halfD) => {
-    const shape = new CANNON.Box(new CANNON.Vec3(halfW, halfH, halfD));
-    const body = new CANNON.Body({ mass: 0 });
-    body.addShape(shape);
-    body.position.set(cx, y0, cz);
-    body.userData = { isMazeWall: true };
-    world.addBody(body);
-    const mesh = new THREE.Mesh(
-      new THREE.BoxGeometry(halfW * 2, halfH * 2, halfD * 2),
-      missionInteriorWallMat
-    );
-    mesh.position.set(cx, y0, cz);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    scene.add(mesh);
-    mazeWallColliders.push({
-      minX: cx - halfW,
-      maxX: cx + halfW,
-      minZ: cz - halfD,
-      maxZ: cz + halfD,
-    });
-    missionInteriorEntries.push({ body, mesh });
+    addVerticalBlock(cx, y0, cz, halfW, halfH, halfD, missionInteriorWallMat);
   };
 
   addSeg(0, 120, 88, 2.2);
@@ -821,9 +1332,104 @@ function buildMissionInterior() {
   addSeg(105, 105, 28, 28);
   addSeg(105, -105, 28, 28);
   addSeg(-105, -105, 28, 28);
+
+  addElevatedPlatform(-55, 65, 9, 4.5, 5.2);
+  addElevatedPlatform(55, -65, 8, 5, 4.8);
+  addElevatedPlatform(0, 98, 10, 3.5, 5.5);
+  addElevatedPlatform(-90, -42, 7, 7, 4.5);
+  addElevatedPlatform(88, 32, 12, 3, 5.8);
+  addElevatedPlatform(-28, -112, 11, 4, 4.6);
+  addElevatedPlatform(72, -95, 6, 6, 4.2);
+
+  const monoH = 5.5;
+  addVerticalBlock(-95, monoH, 28, 1.2, monoH, 1.2, missionInteriorWallMat);
+  addVerticalBlock(102, monoH, -58, 1.4, monoH, 1.2, missionInteriorWallMat);
+  addVerticalBlock(-30, 4.2, 115, 2.2, 4.2, 2.2, missionInteriorWallMat);
+
+  addDestructibleWall(38, y0, 18, 1.15, halfH, 0.5);
+  addDestructibleWall(-42, y0, -22, 0.45, halfH, 2.4);
+
+  missionTurretSystem.spawnMissionTurret(52, 0, -38);
+  missionTurretSystem.spawnMissionTurret(-68, 0, 82);
+  missionTurretSystem.spawnMissionTurret(-20, 5.55, 96);
+
+  buildMissionObjectiveEntity();
+
+  const grid = new THREE.GridHelper(340, 34, 0x5590c8, 0x3a5060);
+  grid.position.y = 0.02;
+  if (grid.material && !Array.isArray(grid.material)) {
+    grid.material.transparent = true;
+    grid.material.opacity = 0.42;
+    grid.material.depthWrite = false;
+  }
+  scene.add(grid);
+  missionVisualExtras.push(grid);
+}
+
+const missionSceneLights = [];
+
+function clearMissionSceneLights() {
+  for (const o of missionSceneLights) {
+    scene.remove(o);
+  }
+  missionSceneLights.length = 0;
+}
+
+function applyMissionPresentation() {
+  scene.background.setHex(0x080e18);
+  groundMat.color.setHex(0x243044);
+  groundMat.emissive.setHex(0x101828);
+  groundMat.emissiveIntensity = 0.12;
+  ambient.color.setHex(0x7a88aa);
+  ambient.intensity = 0.52;
+  sun.color.setHex(0xfff0e0);
+  sun.intensity = 1.12;
+  missionInteriorWallMat.emissive.setHex(0x182840);
+  missionInteriorWallMat.emissiveIntensity = 0.38;
+  missionDeckMat.emissive.setHex(0x203048);
+  missionDeckMat.emissiveIntensity = 0.22;
+  missionRampMat.emissive.setHex(0x182030);
+  missionRampMat.emissiveIntensity = 0.2;
+  clearMissionSceneLights();
+  const addPl = (x, y, z, color, inten) => {
+    const L = new THREE.PointLight(color, inten, 160, 2.1);
+    L.position.set(x, y, z);
+    scene.add(L);
+    missionSceneLights.push(L);
+  };
+  addPl(92, 16, 58, 0xff8844, 0.72);
+  addPl(-78, 14, -68, 0x55b0ff, 0.62);
+  addPl(-52, 18, 102, 0x66ffcc, 0.52);
+  addPl(118, 11, -82, 0xffaa66, 0.58);
+  addPl(0, 22, 0, 0xaaccff, 0.35);
+  addPl(-110, 12, 40, 0xff66aa, 0.4);
+}
+
+function applyWavesPresentation() {
+  scene.background.setHex(0x0c0c14);
+  groundMat.color.setHex(0x1e2430);
+  groundMat.emissive.setHex(0x000000);
+  groundMat.emissiveIntensity = 0;
+  ambient.color.setHex(0x6a7090);
+  ambient.intensity = 0.45;
+  sun.color.setHex(0xfff4e8);
+  sun.intensity = 1.05;
+  missionInteriorWallMat.emissive.setHex(0x101a28);
+  missionInteriorWallMat.emissiveIntensity = 0.24;
+  missionDeckMat.emissive.setHex(0x182030);
+  missionDeckMat.emissiveIntensity = 0.15;
+  missionRampMat.emissive.setHex(0x101820);
+  missionRampMat.emissiveIntensity = 0.12;
+  clearMissionSceneLights();
 }
 
 function buildWavesArena() {
+  purgeAllDrones();
+  resetWaveState();
+  normalKillsForElite = 0;
+  waveSystemBootstrapped = false;
+  missionSystemBootstrapped = false;
+  missionCompleteShown = false;
   clearArenaWalls();
   clearMissionInterior();
   addArenaOuterWalls(ARENA_HALF);
@@ -831,30 +1437,83 @@ function buildWavesArena() {
   scene.fog.near = 25;
   scene.fog.far = 90;
   applySunShadowForArenaHalf(ARENA_HALF);
+  applyWavesPresentation();
   resetPlayerSpawn();
 }
 
 function buildMissionArena() {
+  purgeAllDrones();
+  resetWaveState();
+  normalKillsForElite = 0;
+  waveSystemBootstrapped = false;
+  missionSystemBootstrapped = false;
+  missionCompleteShown = false;
   clearArenaWalls();
   clearMissionInterior();
   addArenaOuterWalls(MISSION_ARENA_HALF);
   buildMissionInterior();
-  scene.fog.color.setHex(0x0c0c14);
-  scene.fog.near = 38;
-  scene.fog.far = 240;
+  scene.fog.color.setHex(0x0c1018);
+  scene.fog.near = 48;
+  scene.fog.far = 320;
   applySunShadowForArenaHalf(MISSION_ARENA_HALF);
+  applyMissionPresentation();
   resetPlayerSpawn();
 }
 
-buildWavesArena();
-
+/** Colisión jugador: cápsula (cilindro + esferas) alineada al mundo; el movimiento sigue siendo PointerLock + cámara. */
 const playerBody = new CANNON.Body({ mass: 0 });
 playerBody.type = CANNON.Body.STATIC;
-playerBody.addShape(new CANNON.Sphere(PLAYER_HIT_RADIUS));
+{
+  const capR = PLAYER_HIT_RADIUS * PLAYER_CAPSULE_RADIUS_MULT;
+  const cylH = Math.max(0.35, PLAYER_EYE_HEIGHT - 2 * capR);
+  const cyl = new CANNON.Cylinder(capR, capR, cylH, 12);
+  playerBody.addShape(cyl, new CANNON.Vec3(0, -PLAYER_EYE_HEIGHT * 0.5, 0));
+  playerBody.addShape(
+    new CANNON.Sphere(capR),
+    new CANNON.Vec3(0, -PLAYER_EYE_HEIGHT + capR, 0)
+  );
+  playerBody.addShape(new CANNON.Sphere(capR), new CANNON.Vec3(0, -capR, 0));
+}
 playerBody.collisionFilterGroup = COLLISION_GROUP_PLAYER_BODY;
 playerBody.collisionFilterMask = -1;
+playerBody.material = playerPhysicsMaterial;
 playerBody.userData = { isPlayer: true };
 world.addBody(playerBody);
+registerPhysicsObject({ body: playerBody, mesh: null, kind: 'playerCapsule' });
+
+const _mlosFrom = new CANNON.Vec3();
+const _mlosTo = new CANNON.Vec3();
+const _mlosRes = new CANNON.RaycastResult();
+/** LOS compartido: drones, torretas. */
+function missionPhysicsLineOfSightBlocked(ox, oy, oz, tx, ty, tz) {
+  let cx = ox;
+  let cy = oy;
+  let cz = oz;
+  for (let iter = 0; iter < 28; iter++) {
+    _mlosFrom.set(cx, cy, cz);
+    _mlosTo.set(tx, ty, tz);
+    _mlosRes.reset();
+    world.raycastClosest(_mlosFrom, _mlosTo, { skipBackfaces: true }, _mlosRes);
+    if (!_mlosRes.hasHit) return false;
+    const hit = _mlosRes.body;
+    if (hit === playerBody) return false;
+    const ud = hit.userData || {};
+    if (ud.ground || ud.wall) return true;
+    const hp = _mlosRes.hitPointWorld;
+    const dx = tx - cx;
+    const dy = ty - cy;
+    const dz = tz - cz;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-5) return false;
+    const nx = dx / len;
+    const ny = dy / len;
+    const nz = dz / len;
+    cx = hp.x + nx * 0.1;
+    cy = hp.y + ny * 0.1;
+    cz = hp.z + nz * 0.1;
+  }
+  return true;
+}
 
 const cubeMeshes = [];
 const projectileMeshes = [];
@@ -868,6 +1527,7 @@ const {
   randomSpawnPointAroundPlayer,
   createDrone,
   killDrone,
+  purgeAllDrones: purgeAllDronesImpl,
   updateDronesAI,
   updateDronesDeath,
   syncDroneMeshes,
@@ -876,6 +1536,8 @@ const {
   scene,
   world,
   playerTarget,
+  playerBody,
+  lineOfSightBlocked: missionPhysicsLineOfSightBlocked,
   getSpawnClampHalf: getActiveArenaHalf,
   getCubeMeshes: () => cubeMeshes,
   createEnemyProjectile: (...a) => createEnemyProjectileRef(...a),
@@ -891,7 +1553,7 @@ const {
     if (waveState.isWaveActive) {
       waveState.enemiesRemainingInWave -= 1;
     }
-    if (!drone.elite) {
+    if (gameMode === 'waves' && !drone.elite) {
       normalKillsForElite += 1;
       if (
         normalKillsForElite % ELITE_SPAWN_EVERY_NORMAL_KILLS === 0 &&
@@ -907,6 +1569,62 @@ const {
     updateGameHud();
   },
 });
+purgeAllDrones = purgeAllDronesImpl;
+
+function getRandomMissionSpawnPoint() {
+  const ah = getActiveArenaHalf();
+  for (let attempt = 0; attempt < 55; attempt++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 48 + Math.random() * (ah * 0.62);
+    let x = Math.cos(angle) * dist;
+    let z = Math.sin(angle) * dist;
+    x = THREE.MathUtils.clamp(x, -ah * 0.9, ah * 0.9);
+    z = THREE.MathUtils.clamp(z, -ah * 0.9, ah * 0.9);
+    if (Math.hypot(x, z - 8) > 28) {
+      return { x, y: 0.9 + Math.random() * 4, z };
+    }
+  }
+  return { x: ah * 0.45, y: 2, z: -ah * 0.4 };
+}
+
+function spawnMissionPatrol() {
+  const types = [
+    DRONE_TYPE_CHASER,
+    DRONE_TYPE_ORBITER,
+    DRONE_TYPE_SHOOTER,
+  ];
+  for (let i = 0; i < MISSION_PATROL_DRONE_COUNT; i++) {
+    if (drones.filter((d) => !d.dying).length >= MAX_DRONES) break;
+    const p = getRandomMissionSpawnPoint();
+    createDrone(p.x, p.y, p.z, { behaviorType: types[i % 3] });
+  }
+}
+
+function showMissionCompleteBanner() {
+  if (!waveBannerEl) return;
+  waveBannerEl.textContent = 'SECTOR LIMPIO';
+  waveBannerEl.setAttribute('aria-hidden', 'false');
+  waveBannerEl.classList.add('wave-banner-show');
+  setTimeout(() => {
+    waveBannerEl.classList.remove('wave-banner-show');
+    waveBannerEl.setAttribute('aria-hidden', 'true');
+  }, WAVE_BANNER_DURATION_MS);
+}
+
+function updateMissionCompletion() {
+  if (gameMode !== 'mission' || !missionSystemBootstrapped || missionCompleteShown) {
+    return;
+  }
+  if (isGameOver) return;
+  const alive =
+    drones.filter((d) => !d.dying).length + missionTurretSystem.aliveCount();
+  if (alive !== 0) return;
+  if (missionObjectiveState.state !== 'delivered') return;
+  missionCompleteShown = true;
+  showMissionCompleteBanner();
+}
+
+buildWavesArena();
 
 const projGeo = new THREE.SphereGeometry(PROJ_RADIUS, 12, 12);
 const pickGeo = new THREE.SphereGeometry(PROJ_PICK_RADIUS, 16, 16);
@@ -1020,13 +1738,17 @@ function applyVortexProjectileIgnorePlayer(entry) {
 function restoreVortexProjectilePlayerCollision(entry) {
   if (entry?.kind !== 'projectile' || !entry.projectileEnt) return;
   const pb = entry.projectileEnt.body;
+  const ent = entry.projectileEnt;
   if (entry._vortexPlayerMaskSave != null) {
     pb.collisionFilterMask = entry._vortexPlayerMaskSave;
     delete entry._vortexPlayerMaskSave;
   } else {
-    /** Respaldo: si no hubo guardado, forzar colisión por defecto con el jugador. */
-    pb.collisionFilterGroup = COLLISION_GROUP_ENEMY_PROJECTILE;
-    pb.collisionFilterMask = COLLISION_MASK_ENEMY_PROJECTILE;
+    if (ent.state === 'friendly') {
+      applyFriendlyProjectileCollisionFilters(ent);
+    } else {
+      pb.collisionFilterGroup = COLLISION_GROUP_ENEMY_PROJECTILE;
+      pb.collisionFilterMask = COLLISION_MASK_ENEMY_PROJECTILE;
+    }
   }
 }
 
@@ -1483,6 +2205,7 @@ function completeMagneticFusion(entryA, entryB) {
       true
     );
     grabbedBody = plasmaEnt.body;
+    plasmaEnt.fusionExplosionOnImpact = true;
     applyGrabTransparency(plasmaEnt.visualMesh, GRAB_PLASMA_HELD_OPACITY);
     physicsTimeScale = 1;
     clearGrabGlow();
@@ -1775,6 +2498,7 @@ function addCube(x, y, z, color) {
   mesh.userData.body = body;
   mesh.userData.isGrabbable = true;
   body.userData = { isCube: true };
+  registerPhysicsObject({ body, mesh, kind: 'cube' });
   cubeMeshes.push(mesh);
 }
 
@@ -1795,17 +2519,19 @@ function isArenaWallBody(body) {
   return Boolean(body?.userData?.isArenaWall);
 }
 
-/** Proyectiles de fusión (burbuja / plasma / telequinesis) o burbuja enemiga. */
-function isFusionExplosionProjectile(ent) {
-  if (!ent || ent.dead || grabbedBody === ent.body) return false;
-  if (ent.shieldStuck || ent.shieldDropping) return false;
-  if (ent.state === 'friendly') {
-    return Boolean(ent.bubbleMode || ent.plasmaDir || ent.friendlyFlightDir);
-  }
-  if (ent.state === 'enemy') {
-    return Boolean(ent.bubbleMode);
-  }
-  return false;
+function isGroundLikePhysicsBody(body) {
+  if (!body || body === playerBody) return false;
+  if (body === groundBody) return true;
+  const u = body.userData;
+  return Boolean(
+    u &&
+      (u.ground || u.isWalkableDeck || u.isRampStep || u.isPhysicsRamp)
+  );
+}
+
+function isWallLikePhysicsBody(body) {
+  const u = body?.userData;
+  return Boolean(u && (u.wall || u.isArenaWall || u.isMazeWall));
 }
 
 const fusionExplosionTriggers = [];
@@ -2076,75 +2802,6 @@ function updateFusionExplosionLights(dt) {
   }
 }
 
-function fuseProjectileExplode(ent) {
-  if (!ent || ent.dead) return;
-  const p = ent.body.position;
-  const vx = ent.body.velocity.x;
-  const vy = ent.body.velocity.y;
-  const vz = ent.body.velocity.z;
-  const sp = Math.hypot(vx, vy, vz);
-  spawnFusionExplosionEffects(p.x, p.y, p.z, sp);
-  removeProjectile(ent);
-}
-
-/**
- * Rebote tipo burbuja: pierde energía, velocidad acotada, dirección con variación aleatoria.
- * @returns {'graze'|'bounced'}
- */
-function applyExplosiveBubbleBarrierBounce(ent, nx, ny, nz, restitution) {
-  const b = ent.body;
-  const nlen = Math.hypot(nx, ny, nz);
-  if (nlen < 1e-6) return 'graze';
-  const nnx = nx / nlen;
-  const nny = ny / nlen;
-  const nnz = nz / nlen;
-  const vx = b.velocity.x;
-  const vy = b.velocity.y;
-  const vz = b.velocity.z;
-  const vn = vx * nnx + vy * nny + vz * nnz;
-  /** Solo ignorar si ya se separa de la superficie (antes “graze” fallaba y el rayo seguía clavado en la pared). */
-  if (vn > 0.06) return 'graze';
-  const e = restitution;
-  let ox = vx - (1 + e) * vn * nnx;
-  let oy = vy - (1 + e) * vn * nny;
-  let oz = vz - (1 + e) * vn * nnz;
-  ox += (Math.random() - 0.5) * BUBBLE_RANDOM_IMPULSE;
-  oy += (Math.random() - 0.5) * BUBBLE_RANDOM_IMPULSE;
-  oz += (Math.random() - 0.5) * BUBBLE_RANDOM_IMPULSE;
-  const rawLen = Math.hypot(ox, oy, oz);
-  if (rawLen < 1e-5) {
-    ox = nnx;
-    oy = Math.abs(nny) > 0.9 ? 0 : 1;
-    oz = nnz;
-  }
-  const il = Math.hypot(ox, oy, oz);
-  const invl = il > 1e-6 ? 1 / il : 1;
-  let dx = ox * invl;
-  let dy = oy * invl;
-  let dz = oz * invl;
-  let sp = rawLen * BUBBLE_SPEED_RETENTION;
-  sp = THREE.MathUtils.clamp(sp, BUBBLE_MIN_SPEED, BUBBLE_MAX_SPEED);
-  delete ent.enemyDir;
-  delete ent.plasmaDir;
-  delete ent.friendlyFlightDir;
-  delete ent.friendlyFlightSpeed;
-  ent.bubbleMode = true;
-  ent.bubbleDir = { x: dx, y: dy, z: dz };
-  ent.bubbleSpeed = sp;
-  ent.pathTraveled = 0;
-  b.velocity.set(dx * sp, dy * sp, dz * sp);
-  b.angularVelocity.set(0, 0, 0);
-  return 'bounced';
-}
-
-function tryBubbleBounceFromContact(ent, contact, restitution) {
-  if (!contact?.ni) return 'graze';
-  const nx = -contact.ni.x;
-  const ny = -contact.ni.y;
-  const nz = -contact.ni.z;
-  return applyExplosiveBubbleBarrierBounce(ent, nx, ny, nz, restitution);
-}
-
 function getProjectileSphereRadius(ent) {
   const sh = ent.body.shapes?.[0];
   if (sh && typeof sh.radius === 'number') return sh.radius;
@@ -2194,18 +2851,18 @@ function resolveProjectileArenaTunneling() {
 
     const nh = Math.hypot(nx, nz);
     if (nh < 1e-6) continue;
-    if (isFusionExplosionProjectile(ent)) {
-      fuseProjectileExplode(ent);
-      continue;
-    }
-    applyExplosiveBubbleBarrierBounce(
-      ent,
-      nx / nh,
-      0,
-      nz / nh,
-      BUBBLE_WALL_RESTITUTION
-    );
+    removeProjectile(ent);
   }
+}
+
+/**
+ * Los drones ignoran el grupo COLLISION_GROUP_ENEMY_PROJECTILE (balas enemigas).
+ * Las balas aliadas deben usar grupo 1 (como el plasma) para poder impactar drones.
+ */
+function applyFriendlyProjectileCollisionFilters(ent) {
+  if (!ent?.body) return;
+  ent.body.collisionFilterGroup = 1;
+  ent.body.collisionFilterMask = COLLISION_MASK_ENEMY_PROJECTILE;
 }
 
 function captureProjectileVisual(ent) {
@@ -2217,6 +2874,8 @@ function captureProjectileVisual(ent) {
   delete ent.enemyDir;
   delete ent.friendlyFlightDir;
   delete ent.friendlyFlightSpeed;
+  ent.fusionExplosionOnImpact = false;
+  applyFriendlyProjectileCollisionFilters(ent);
   const mat = ent.visualMesh.material;
   mat.color.setHex(0x22eeff);
   mat.emissive.setHex(0x00ccff);
@@ -2224,37 +2883,97 @@ function captureProjectileVisual(ent) {
   mat.needsUpdate = true;
 }
 
+/** Explosión al impactar solo si el proyectil resultó de fusión (2+). */
+function fuseProjectileExplode(ent) {
+  if (!ent || ent.dead) return;
+  const p = ent.body.position;
+  const sp = Math.hypot(
+    ent.body.velocity.x,
+    ent.body.velocity.y,
+    ent.body.velocity.z
+  );
+  spawnFusionExplosionEffects(p.x, p.y, p.z, Math.max(sp, 12));
+  removeProjectile(ent);
+}
+
+function disposeFriendlyProjectileHit(ent) {
+  if (!ent || ent.dead) return;
+  if (ent.fusionExplosionOnImpact) fuseProjectileExplode(ent);
+  else removeProjectile(ent);
+}
+
+const DESTRUCTIBLE_WALL_MIN_SPEED = 22;
+
 function onProjectileCollide(ent, other, contact) {
   if (!ent || ent.dead) return;
 
-  const drone = drones.find((d) => !d.dying && d.body === other);
-  if (drone) {
-    // Solo balas aliadas (del jugador) matan drones; las enemigas los ignoran.
-    if (ent.state === 'friendly' && !ent.shieldStuck) {
-      killDrone(drone);
-      fuseProjectileExplode(ent);
+  const otherProj = other?.userData?.projectileEnt;
+  if (otherProj && otherProj !== ent && !otherProj.dead) {
+    if (
+      ent.plasmaDir &&
+      otherProj.plasmaDir &&
+      ent.state === 'friendly' &&
+      otherProj.state === 'friendly'
+    ) {
+      if (ent.body.id < other.body.id) {
+        growPlasmaProjectile(ent);
+        removeProjectile(otherProj);
+      }
+      return;
+    }
+    if (ent.body.id < other.body.id) {
+      removeProjectile(ent);
+      removeProjectile(otherProj);
     }
     return;
   }
 
-  if (other === groundBody && ent.state === 'enemy') {
-    if (ent.shieldStuck) return;
-    if (isFusionExplosionProjectile(ent)) {
-      fuseProjectileExplode(ent);
-      return;
+  const tur = other?.userData?.turretEntry;
+  if (tur && !tur.dead) {
+    if (ent.state === 'friendly' && !ent.shieldStuck) {
+      missionTurretSystem.damageTurret(tur, 2);
+      disposeFriendlyProjectileHit(ent);
     }
-    tryBubbleBounceFromContact(ent, contact, BUBBLE_GROUND_RESTITUTION);
     return;
   }
-  if (ent.state === 'enemy' && isArenaWallBody(other)) {
-    if (ent.shieldStuck) return;
-    if (isFusionExplosionProjectile(ent)) {
-      fuseProjectileExplode(ent);
+
+  const dwEnt = other?.userData?.destructibleWallEntry;
+  if (dwEnt) {
+    const sp = ent.body.velocity.length();
+    if (sp >= DESTRUCTIBLE_WALL_MIN_SPEED && !ent.shieldStuck) {
+      dwEnt.hp -= 1;
+      if (ent.state === 'friendly') disposeFriendlyProjectileHit(ent);
+      else removeProjectile(ent);
+      if (dwEnt.hp <= 0) destroyDestructibleWallEntry(dwEnt);
       return;
     }
-    tryBubbleBounceFromContact(ent, contact, BUBBLE_WALL_RESTITUTION);
+  }
+
+  const drone = drones.find((d) => !d.dying && d.body === other);
+  if (drone) {
+    if (ent.state === 'friendly' && !ent.shieldStuck) {
+      killDrone(drone);
+      disposeFriendlyProjectileHit(ent);
+    }
     return;
   }
+
+  const hitCube = cubeMeshes.some((m) => m.userData.body === other);
+  const hitStaticWorld =
+    isGroundLikePhysicsBody(other) ||
+    isWallLikePhysicsBody(other) ||
+    hitCube;
+
+  if (hitStaticWorld) {
+    if (ent.shieldStuck) return;
+    if (ent.state === 'friendly') {
+      disposeFriendlyProjectileHit(ent);
+    } else {
+      removeProjectile(ent);
+    }
+    return;
+  }
+
   if (other === playerBody && ent.state === 'enemy') {
     if (ent.shieldStuck) return;
     if (isBodyMagneticallyCaptured(ent.body)) return;
@@ -2270,30 +2989,6 @@ function onProjectileCollide(ent, other, contact) {
   }
   if (ent.state === 'friendly') {
     if (other === playerBody) return;
-    if (other === groundBody) {
-      if (isFusionExplosionProjectile(ent)) {
-        fuseProjectileExplode(ent);
-        return;
-      }
-      tryBubbleBounceFromContact(ent, contact, BUBBLE_GROUND_RESTITUTION);
-      return;
-    }
-    if (isArenaWallBody(other)) {
-      if (isFusionExplosionProjectile(ent)) {
-        fuseProjectileExplode(ent);
-        return;
-      }
-      tryBubbleBounceFromContact(ent, contact, BUBBLE_WALL_RESTITUTION);
-      return;
-    }
-    const cubeHit = cubeMeshes.find((m) => m.userData.body === other);
-    if (cubeHit && isFusionExplosionProjectile(ent)) {
-      const sp = ent.body.velocity.length();
-      if (sp >= FUSION_IMPACT_MIN_SPEED_CUBE) {
-        fuseProjectileExplode(ent);
-        return;
-      }
-    }
   }
 }
 
@@ -2444,6 +3139,7 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz, opts = {}) {
     collisionResponse: true,
     collisionFilterGroup: COLLISION_GROUP_ENEMY_PROJECTILE,
     collisionFilterMask: COLLISION_MASK_ENEMY_PROJECTILE,
+    material: projectilePhysicsMaterial,
   });
   body.addShape(shape);
 
@@ -2463,6 +3159,7 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz, opts = {}) {
     enemySpeedScale: speedMult,
     /** Dirección de vuelo fija (sin gravedad; se re-aplica cada frame). */
     enemyDir: { x: nx, y: ny, z: nz },
+    fusionExplosionOnImpact: false,
   };
   new EnemyBullet(ent);
 
@@ -2501,6 +3198,16 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz, opts = {}) {
 }
 createEnemyProjectileRef = createEnemyProjectile;
 
+missionTurretSystem = createMissionTurretSystem({
+  scene,
+  world,
+  playerTarget,
+  createEnemyProjectile: (...a) => createEnemyProjectileRef(...a),
+  lineOfSightBlocked: missionPhysicsLineOfSightBlocked,
+  worldStaticPhysicsMaterial,
+  registerPhysicsObject,
+});
+
 function applyPlasmaTierToBody(ent) {
   const tier = Math.min(
     Math.max(1, ent.plasmaTier || 1),
@@ -2524,6 +3231,7 @@ function applyPlasmaTierToBody(ent) {
 }
 
 function growPlasmaProjectile(ent) {
+  ent.fusionExplosionOnImpact = true;
   ent.plasmaTier = Math.min(
     (ent.plasmaTier || 1) + 1,
     PLASMA_MAX_TIER
@@ -2538,7 +3246,7 @@ function growPlasmaProjectile(ent) {
   mat.needsUpdate = true;
 }
 
-/** Fusión bala+bala: vuelo rápido hasta el 1.er rebote; luego burbuja como el resto. */
+/** Bala de plasma (fusión): vuelo recto; impacto con geometría = destrucción; fusión bala-bala dispara efectos. */
 function createPlasmaBolt(x, y, z, dx, dy, dz, holdInHand = false) {
   let dist = Math.hypot(dx, dy, dz);
   let nx;
@@ -2588,6 +3296,7 @@ function createPlasmaBolt(x, y, z, dx, dy, dz, holdInHand = false) {
     collisionResponse: true,
     collisionFilterGroup: 1,
     collisionFilterMask: COLLISION_MASK_ENEMY_PROJECTILE,
+    material: projectilePhysicsMaterial,
   });
   body.addShape(shape);
 
@@ -2613,6 +3322,7 @@ function createPlasmaBolt(x, y, z, dx, dy, dz, holdInHand = false) {
     plasmaDir: { x: nx, y: ny, z: nz },
     plasmaPierceLeft: PROJ_PLASMA_PIERCE_COUNT,
     plasmaTier: 1,
+    fusionExplosionOnImpact: false,
   };
   new EnemyBullet(ent);
 
@@ -2681,8 +3391,7 @@ function updateProjectileLife(dt) {
     if (
       (ent.state === 'enemy' ||
         ent.plasmaDir ||
-        ent.friendlyFlightDir ||
-        ent.bubbleMode) &&
+        ent.friendlyFlightDir) &&
       grabbedBody !== ent.body &&
       (Math.abs(p.x) > escapeR ||
         Math.abs(p.z) > escapeR ||
@@ -2692,7 +3401,7 @@ function updateProjectileLife(dt) {
       removeProjectile(ent);
       continue;
     }
-    if (grabbedBody !== ent.body && !ent.bubbleMode) {
+    if (grabbedBody !== ent.body) {
       let spd;
       if (ent.plasmaDir) spd = PROJ_PLASMA_SPEED;
       else if (ent.state === 'enemy' && ent.enemyDir)
@@ -2711,14 +3420,13 @@ function updateProjectileLife(dt) {
         continue;
       }
     }
-    const lifeCap = ent.bubbleMode ? PROJ_BUBBLE_MAX_LIFE : PROJ_MAX_LIFE;
-    if (ent.age > lifeCap && grabbedBody !== ent.body) {
+    if (ent.age > PROJ_MAX_LIFE && grabbedBody !== ent.body) {
       removeProjectile(ent);
     }
   }
 }
 
-/** Antes de integrar: en rectos solo se cancela parte de la gravedad; burbujas caen con el mundo. */
+/** Antes de integrar: en vuelo recto se cancela parte de la gravedad. */
 function cancelEnemyProjectileGravity() {
   const g = world.gravity;
   const gx = g.x;
@@ -2731,7 +3439,6 @@ function cancelEnemyProjectileGravity() {
     if (isBodyInMagneticFusion(ent.body)) continue;
     if (ent.shieldStuck || ent.shieldDropping) continue;
     if (grabbedBody === ent.body) continue;
-    if (ent.bubbleMode) continue;
     const enemyRay = ent.state === 'enemy' && ent.enemyDir;
     const plasmaRay = Boolean(ent.plasmaDir);
     const friendlyRay =
@@ -2745,7 +3452,7 @@ function cancelEnemyProjectileGravity() {
   }
 }
 
-/** Después del paso: rectos mantienen velocidad en la mira pero mezclan un poco de caída; burbujas = física libre. */
+/** Después del paso: vuelo recto mantiene velocidad en la mira con un poco de caída física. */
 function enforceEnemyProjectileStraightFlight() {
   const blend = PROJ_GRAVITY_BLEND_Y;
   for (const ent of enemyProjectiles) {
@@ -2754,7 +3461,6 @@ function enforceEnemyProjectileStraightFlight() {
     if (isBodyInMagneticFusion(ent.body)) continue;
     if (ent.shieldStuck || ent.shieldDropping) continue;
     if (grabbedBody === ent.body) continue;
-    if (ent.bubbleMode) continue;
     if (ent.state === 'enemy' && ent.enemyDir) {
       const d = ent.enemyDir;
       const b = ent.body;
@@ -2956,7 +3662,6 @@ function updateBulletTimeAndPhysicsScale() {
   physicsTimeScale = near ? BULLET_TIME_SCALE : 1;
 }
 
-let waveSystemBootstrapped = false;
 let testMgTimerA = 0;
 let testMgTimerB = 0;
 
@@ -3189,6 +3894,7 @@ window.addEventListener('mouseup', (e) => {
     if (pe && pe.state === 'friendly' && !pe.plasmaDir) {
       pe.friendlyFlightDir = { x: dir.x, y: dir.y, z: dir.z };
       pe.friendlyFlightSpeed = launchSpeed;
+      applyFriendlyProjectileCollisionFilters(pe);
     }
     grabbedBody.angularVelocity.set(
       (Math.random() - 0.5) * 4,
@@ -3225,6 +3931,7 @@ window.addEventListener('keydown', (e) => {
   }
   if (e.code === 'KeyE' && !e.repeat && controls.isLocked && !isPaused) {
     e.preventDefault();
+    if (gameMode === 'mission' && tryMissionObjectiveInteractMaybe()) return;
     tryStartMagneticFusion();
     return;
   }
@@ -3283,32 +3990,64 @@ function resolvePlayerXZAgainstMaze(px, pz, radius) {
   let x = px;
   let z = pz;
   const r = radius;
-  for (const box of mazeWallColliders) {
-    const qx = THREE.MathUtils.clamp(x, box.minX, box.maxX);
-    const qz = THREE.MathUtils.clamp(z, box.minZ, box.maxZ);
-    let dx = x - qx;
-    let dz = z - qz;
-    const d2 = dx * dx + dz * dz;
-    if (d2 < 1e-10) {
-      const distLeft = x - box.minX;
-      const distRight = box.maxX - x;
-      const distDown = z - box.minZ;
-      const distUp = box.maxZ - z;
-      const minD = Math.min(distLeft, distRight, distDown, distUp);
-      if (minD === distLeft) x = box.minX - r;
-      else if (minD === distRight) x = box.maxX + r;
-      else if (minD === distDown) z = box.minZ - r;
-      else z = box.maxZ + r;
-      continue;
+  for (let pass = 0; pass < 2; pass++) {
+    for (const box of mazeWallColliders) {
+      const qx = THREE.MathUtils.clamp(x, box.minX, box.maxX);
+      const qz = THREE.MathUtils.clamp(z, box.minZ, box.maxZ);
+      let dx = x - qx;
+      let dz = z - qz;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < 1e-10) {
+        const distLeft = x - box.minX;
+        const distRight = box.maxX - x;
+        const distDown = z - box.minZ;
+        const distUp = box.maxZ - z;
+        const minD = Math.min(distLeft, distRight, distDown, distUp);
+        if (minD === distLeft) x = box.minX - r;
+        else if (minD === distRight) x = box.maxX + r;
+        else if (minD === distDown) z = box.minZ - r;
+        else z = box.maxZ + r;
+        continue;
+      }
+      if (d2 >= r * r) continue;
+      const d = Math.sqrt(d2);
+      dx /= d;
+      dz /= d;
+      x = qx + dx * r;
+      z = qz + dz * r;
     }
-    if (d2 >= r * r) continue;
-    const d = Math.sqrt(d2);
-    dx /= d;
-    dz /= d;
-    x = qx + dx * r;
-    z = qz + dz * r;
   }
   return { x, z };
+}
+
+function tryApplyStepUp(px, pz, feetY, groundY, moveDirXZ) {
+  if (walkableFootSurfaces.length === 0) return;
+  // Rampa continua: el escalón lógico dispara PLAYER_STEP_BOOST_VELOCITY cada frame,
+  // rompe grounded (vel > umbral) y el jugador pierde el suelo. Las rampas usan
+  // registerZRampSlope + snap; no mezclar con impulso de escalón.
+  if (rampSlopeWalkables.length > 0) return;
+  if (moveDirXZ.lengthSq() < 1e-8) return;
+  const len = Math.hypot(moveDirXZ.x, moveDirXZ.z);
+  const dx = moveDirXZ.x / len;
+  const dz = moveDirXZ.z / len;
+  const ax = px + dx * PLAYER_STEP_PROBE;
+  const az = pz + dz * PLAYER_STEP_PROBE;
+  const aheadGround = getSupportingGroundY(
+    ax,
+    az,
+    feetY + PLAYER_STEP_HEIGHT + 0.12
+  );
+  const stepFeetTol = rampSlopeWalkables.length > 0 ? 0.24 : 0.14;
+  if (
+    aheadGround > groundY + 0.03 &&
+    aheadGround <= groundY + PLAYER_STEP_HEIGHT &&
+    Math.abs(feetY - groundY) < stepFeetTol
+  ) {
+    playerVerticalVel = Math.max(
+      playerVerticalVel,
+      PLAYER_STEP_BOOST_VELOCITY
+    );
+  }
 }
 
 function syncPlayerHitBody() {
@@ -3317,6 +4056,61 @@ function syncPlayerHitBody() {
     camera.position.y,
     camera.position.z
   );
+  playerBody.quaternion.set(0, 0, 0, 1);
+}
+
+function drawMinimap(fwX, fwZ) {
+  if (!minimapCtx || !minimapCanvas || !minimapWrap) return;
+  if (!controls.isLocked || isPaused || isGameOver) {
+    minimapWrap.style.display = 'none';
+    minimapWrap.setAttribute('aria-hidden', 'true');
+    return;
+  }
+  minimapWrap.style.display = 'block';
+  const half = getActiveArenaHalf();
+  const w = minimapCanvas.width;
+  const h = minimapCanvas.height;
+  const pad = 10;
+  const ctx = minimapCtx;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = 'rgba(8, 12, 22, 0.72)';
+  ctx.fillRect(0, 0, w, h);
+  const mapW = w - pad * 2;
+  const mapH = h - pad * 2;
+  const mapX = pad;
+  const mapY = pad;
+  ctx.strokeStyle = 'rgba(140, 190, 255, 0.45)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(mapX, mapY, mapW, mapH);
+  ctx.fillStyle = 'rgba(180, 210, 255, 0.85)';
+  ctx.font = 'bold 11px system-ui, sans-serif';
+  ctx.fillText('N', mapX + mapW * 0.5 - 4, mapY - 2);
+  function worldToMap(x, z) {
+    const u = mapX + ((x + half) / (2 * half)) * mapW;
+    const v = mapY + ((half - z) / (2 * half)) * mapH;
+    return [u, v];
+  }
+  const px = camera.position.x;
+  const pz = camera.position.z;
+  const [mx, my] = worldToMap(px, pz);
+  ctx.fillStyle = 'rgba(100, 200, 255, 0.35)';
+  ctx.beginPath();
+  ctx.arc(mx, my, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#66ffaa';
+  ctx.beginPath();
+  ctx.arc(mx, my, 3.2, 0, Math.PI * 2);
+  ctx.fill();
+  const fLen = Math.hypot(fwX, fwZ);
+  const ndx = fLen > 1e-6 ? fwX / fLen : 0;
+  const ndz = fLen > 1e-6 ? fwZ / fLen : 0;
+  ctx.strokeStyle = '#ccffee';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(mx, my);
+  ctx.lineTo(mx + ndx * 16, my - ndz * 16);
+  ctx.stroke();
+  minimapWrap.setAttribute('aria-hidden', 'false');
 }
 
 function animate() {
@@ -3347,34 +4141,111 @@ function animate() {
     if (keys.KeyD) moveDir.add(right);
     if (keys.KeyA) moveDir.sub(right);
     const hasMoveInput = moveDir.lengthSq() > 0;
+    const stepHint = hasMoveInput ? moveDir.clone() : new THREE.Vector3();
     let moveSpeed = MOVE_SPEED;
     const sprintHeld =
       (keys.ShiftLeft || keys.ShiftRight) && stamina > 0 && hasMoveInput;
     if (sprintHeld) {
       moveSpeed *= SPRINT_SPEED_MULT;
     }
+    const half = getActiveArenaHalf();
     if (hasMoveInput) {
-      moveDir.normalize().multiplyScalar(moveSpeed * dt);
-      camera.position.x += moveDir.x;
-      camera.position.z += moveDir.z;
+      moveDir.normalize();
+      const stepX = moveDir.x * moveSpeed * dt;
+      const stepZ = moveDir.z * moveSpeed * dt;
+      const hLen = Math.hypot(stepX, stepZ);
+      const maxH = PLAYER_MAX_HORIZ_DISPLACE_PER_FRAME;
+      const nSteps = Math.max(1, Math.ceil(hLen / maxH));
+      const onRampScene = rampSlopeWalkables.length > 0;
+      for (let si = 0; si < nSteps; si++) {
+        camera.position.x += stepX / nSteps;
+        camera.position.z += stepZ / nSteps;
+        const resolved = resolvePlayerXZAgainstMaze(
+          camera.position.x,
+          camera.position.z,
+          PLAYER_WALL_RADIUS
+        );
+        camera.position.x = THREE.MathUtils.clamp(
+          resolved.x,
+          -half,
+          half
+        );
+        camera.position.z = THREE.MathUtils.clamp(
+          resolved.z,
+          -half,
+          half
+        );
+        // Snap al suelo en cada micro-paso: mantiene contacto al subir pendiente.
+        if (playerVerticalVel <= 0.52) {
+          const fyS = playerEyeY - PLAYER_EYE_HEIGHT;
+          const gyS = getSupportingGroundY(
+            camera.position.x,
+            camera.position.z,
+            fyS
+          );
+          const snapTol = onRampScene ? 0.38 : 0.17;
+          if (fyS <= gyS + snapTol) {
+            playerEyeY = gyS + PLAYER_EYE_HEIGHT;
+            if (playerVerticalVel < 0) playerVerticalVel = 0;
+          }
+        }
+      }
+    } else {
+      const resolved = resolvePlayerXZAgainstMaze(
+        camera.position.x,
+        camera.position.z,
+        PLAYER_WALL_RADIUS
+      );
+      camera.position.x = THREE.MathUtils.clamp(resolved.x, -half, half);
+      camera.position.z = THREE.MathUtils.clamp(resolved.z, -half, half);
     }
-    const resolved = resolvePlayerXZAgainstMaze(
+
+    {
+      const fyPre = playerEyeY - PLAYER_EYE_HEIGHT;
+      const gyPre = getSupportingGroundY(
+        camera.position.x,
+        camera.position.z,
+        fyPre
+      );
+      tryApplyStepUp(
+        camera.position.x,
+        camera.position.z,
+        fyPre,
+        gyPre,
+        stepHint
+      );
+    }
+
+    let feetY = playerEyeY - PLAYER_EYE_HEIGHT;
+    let groundY = getSupportingGroundY(
       camera.position.x,
       camera.position.z,
-      PLAYER_WALL_RADIUS
+      feetY
     );
-    camera.position.x = resolved.x;
-    camera.position.z = resolved.z;
-
-    const half = getActiveArenaHalf();
-    camera.position.x = THREE.MathUtils.clamp(camera.position.x, -half, half);
-    camera.position.z = THREE.MathUtils.clamp(camera.position.z, -half, half);
-
+    const groundSnapY =
+      rampSlopeWalkables.length > 0 ? 0.28 : 0.14;
+    const landSnapY = rampSlopeWalkables.length > 0 ? 0.38 : 0.2;
     let grounded =
-      playerEyeY <= PLAYER_EYE_HEIGHT + 0.08 && playerVerticalVel <= 0.35;
+      feetY <= groundY + groundSnapY && playerVerticalVel <= 0.42;
     if (grounded) {
-      playerEyeY = PLAYER_EYE_HEIGHT;
+      playerEyeY = groundY + PLAYER_EYE_HEIGHT;
       playerVerticalVel = 0;
+    }
+    if (grounded && rampSlopeWalkables.length > 0 && hasMoveInput) {
+      const lenh = Math.hypot(stepHint.x, stepHint.z);
+      if (lenh > 1e-6) {
+        const k = 0.14 / lenh;
+        const feet = playerEyeY - PLAYER_EYE_HEIGHT;
+        const gAhead = getSupportingGroundY(
+          camera.position.x + stepHint.x * k,
+          camera.position.z + stepHint.z * k,
+          feet + 0.5
+        );
+        const rise = gAhead - feet;
+        if (rise > 0.012 && rise < 0.48) {
+          playerEyeY += rise * 0.14;
+        }
+      }
     }
     if (pendingJump && grounded && stamina >= STAMINA_JUMP_COST) {
       playerVerticalVel = PLAYER_JUMP_VELOCITY;
@@ -3391,9 +4262,23 @@ function animate() {
         stamina -= STAMINA_HOVER_DRAIN_PER_SEC * dt;
       }
       playerEyeY += playerVerticalVel * dt;
-      if (playerEyeY <= PLAYER_EYE_HEIGHT) {
-        playerEyeY = PLAYER_EYE_HEIGHT;
+      feetY = playerEyeY - PLAYER_EYE_HEIGHT;
+      groundY = getSupportingGroundY(
+        camera.position.x,
+        camera.position.z,
+        feetY
+      );
+      if (playerVerticalVel <= 0 && feetY <= groundY + landSnapY) {
+        playerEyeY = groundY + PLAYER_EYE_HEIGHT;
         playerVerticalVel = 0;
+        grounded = true;
+      }
+      if (
+        walkableFootSurfaces.length === 0 &&
+        playerEyeY < PLAYER_EYE_HEIGHT
+      ) {
+        playerEyeY = PLAYER_EYE_HEIGHT;
+        playerVerticalVel = Math.min(0, playerVerticalVel);
       }
       if (playerEyeY > ARENA_Y_MAX) {
         playerEyeY = ARENA_Y_MAX;
@@ -3401,6 +4286,8 @@ function animate() {
       }
     }
     camera.position.y = playerEyeY;
+
+    drawMinimap(forward.x, forward.z);
 
     let stDelta = STAMINA_REGEN_PER_SEC;
     if (sprintHeld) {
@@ -3493,15 +4380,31 @@ function animate() {
         );
       }
     }
+  } else if (
+    controls.isLocked &&
+    !isPaused &&
+    !isGameOver &&
+    gameMode === 'mission'
+  ) {
+    if (!TEST_MODE_NO_DRONES && !missionSystemBootstrapped) {
+      missionSystemBootstrapped = true;
+      spawnMissionPatrol();
+      updateGameHud();
+    }
   } else if (!controls.isLocked || isGameOver) {
     testMgTimerA = 0;
     testMgTimerB = 0;
+  }
+
+  if (!isPaused && !isGameOver && gameMode === 'mission') {
+    updateMissionCompletion();
   }
 
   if (!isPaused && !isGameOver) {
     updateBulletTimeAndPhysicsScale();
     if (controls.isLocked) {
       updateDronesAI(dt);
+      if (gameMode === 'mission') missionTurretSystem.update(dt);
     }
     updateProjectileLife(dt);
     syncPlayerHitBody();
@@ -3588,6 +4491,12 @@ function animate() {
   fusionCameraShake.x *= _shakeD;
   fusionCameraShake.y *= _shakeD;
   fusionCameraShake.z *= _shakeD;
+  if (!controls.isLocked || isPaused || isGameOver) {
+    if (minimapWrap) {
+      minimapWrap.style.display = 'none';
+      minimapWrap.setAttribute('aria-hidden', 'true');
+    }
+  }
   camera.position.x += fusionCameraShake.x;
   camera.position.y += fusionCameraShake.y;
   camera.position.z += fusionCameraShake.z;
