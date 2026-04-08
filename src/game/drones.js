@@ -76,8 +76,6 @@ export function createDronesSystem(deps) {
     onDroneKill,
   } = deps;
 
-  const droneGeo = new THREE.SphereGeometry(DRONE_RADIUS, 20, 20);
-  const eliteDroneGeo = new THREE.SphereGeometry(ELITE_DRONE_RADIUS, 22, 22);
   const eliteShieldGeo = new THREE.SphereGeometry(1, 18, 18);
   const eliteShieldMat = new THREE.MeshBasicMaterial({
     color: 0x9933ff,
@@ -138,6 +136,62 @@ export function createDronesSystem(deps) {
     }
   }
 
+  /**
+   * Visual agresivo: núcleo + pinchos (sin tocar física; el cuerpo sigue siendo esfera).
+   */
+  function buildGeometricDroneVisual(coreMaterial, physicsRadius, opts = {}) {
+    const spikeCount = opts.spikeCount ?? 9;
+    const spikeMat = coreMaterial.clone();
+    spikeMat.color.multiplyScalar(0.52);
+    spikeMat.emissive.multiplyScalar(0.62);
+
+    const root = new THREE.Group();
+    const visualRig = new THREE.Group();
+    root.add(visualRig);
+
+    const coreR = physicsRadius * 0.44;
+    const coreGeo = new THREE.IcosahedronGeometry(coreR, 0);
+    const coreMesh = new THREE.Mesh(coreGeo, coreMaterial);
+    coreMesh.castShadow = true;
+    coreMesh.receiveShadow = true;
+    visualRig.add(coreMesh);
+
+    const coneR = physicsRadius * 0.2;
+    const coneH = physicsRadius * 0.52;
+    const coneGeo = new THREE.ConeGeometry(coneR, coneH, 5);
+    const up = new THREE.Vector3(0, 1, 0);
+    const q = new THREE.Quaternion();
+    const pos = new THREE.Vector3();
+    const golden = Math.PI * (3 - Math.sqrt(5));
+
+    for (let i = 0; i < spikeCount; i++) {
+      const y = 1 - (2 * (i + 0.5)) / spikeCount;
+      const rr = Math.sqrt(Math.max(0, 1 - y * y));
+      const t = golden * (i + 0.3 * Math.sin(i * 2.1));
+      const dir = new THREE.Vector3(Math.cos(t) * rr, y, Math.sin(t) * rr).normalize();
+      const spike = new THREE.Mesh(coneGeo, spikeMat);
+      q.setFromUnitVectors(up, dir);
+      spike.quaternion.copy(q);
+      const dist = coreR * 0.72 + coneH * 0.38;
+      pos.copy(dir).multiplyScalar(dist);
+      spike.position.copy(pos);
+      spike.rotation.z += (Math.random() - 0.5) * 0.12;
+      spike.castShadow = true;
+      spike.receiveShadow = true;
+      visualRig.add(spike);
+    }
+
+    return {
+      group: root,
+      visualRig,
+      materials: [coreMaterial, spikeMat],
+      disposeGeometries: () => {
+        coreGeo.dispose();
+        coneGeo.dispose();
+      },
+    };
+  }
+
   /** Colores estilo Pac-Man: chaser rojo, orbiter cyan, shooter naranja. */
   function applyArcadeDroneMaterial(mat, behaviorType) {
     if (behaviorType === DRONE_TYPE_CHASER) {
@@ -181,7 +235,6 @@ export function createDronesSystem(deps) {
     const behaviorType = elite
       ? DRONE_TYPE_CHASER
       : opts.behaviorType ?? pickBehaviorType();
-    const geo = elite ? eliteDroneGeo : droneGeo;
     const mat = new THREE.MeshStandardMaterial({
       color: 0x4a4a55,
       metalness: 0.9,
@@ -201,9 +254,12 @@ export function createDronesSystem(deps) {
     } else {
       applyArcadeDroneMaterial(mat, behaviorType);
     }
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
+
+    const radius = elite ? ELITE_DRONE_RADIUS : DRONE_RADIUS;
+    const visual = buildGeometricDroneVisual(mat, radius, {
+      spikeCount: elite ? 12 : 9,
+    });
+    const mesh = visual.group;
     mesh.position.set(x, y, z);
     const meshBaseScale = elite ? (eliteVariant ? 1.12 : 1.05) : 1;
     mesh.scale.setScalar(meshBaseScale);
@@ -213,8 +269,6 @@ export function createDronesSystem(deps) {
       mesh.add(shield);
     }
     scene.add(mesh);
-
-    const radius = elite ? ELITE_DRONE_RADIUS : DRONE_RADIUS;
     const shape = new CANNON.Sphere(radius);
     const body = new CANNON.Body({
       mass: elite ? ELITE_DRONE_MASS : DRONE_MASS,
@@ -240,6 +294,9 @@ export function createDronesSystem(deps) {
     const drone = {
       id,
       mesh,
+      visualRig: visual.visualRig,
+      droneMaterials: visual.materials,
+      disposeDroneGeometries: visual.disposeGeometries,
       body,
       elite,
       eliteVariant,
@@ -301,9 +358,11 @@ export function createDronesSystem(deps) {
     drone.dying = true;
     drone.deathPhase = 0;
     world.removeBody(drone.body);
-    drone.mesh.material.emissive.setHex(0xff6666);
-    drone.mesh.material.emissiveIntensity = 5;
-    drone.mesh.material.color.setHex(0xffffff);
+    for (const m of drone.droneMaterials) {
+      m.emissive.setHex(0xff6666);
+      m.emissiveIntensity = 5;
+      m.color.setHex(0xffffff);
+    }
 
     onDroneKill(drone, {
       requestEliteSpawn: () => {
@@ -838,7 +897,8 @@ export function createDronesSystem(deps) {
       d.deathPhase += dt;
       if (d.deathPhase < DRONE_FLASH_SEC) {
         const t = d.deathPhase / DRONE_FLASH_SEC;
-        d.mesh.material.emissiveIntensity = 5 * (1 - t) + 2 * t;
+        const ei = 5 * (1 - t) + 2 * t;
+        for (const m of d.droneMaterials) m.emissiveIntensity = ei;
       } else {
         const shrink = Math.max(
           0,
@@ -847,7 +907,8 @@ export function createDronesSystem(deps) {
         d.mesh.scale.setScalar(shrink);
         if (shrink <= 0.02) {
           scene.remove(d.mesh);
-          d.mesh.material.dispose();
+          d.disposeDroneGeometries?.();
+          for (const m of d.droneMaterials) m.dispose();
           drones.splice(i, 1);
         }
       }
@@ -870,18 +931,28 @@ export function createDronesSystem(deps) {
       } else {
         d.mesh.scale.setScalar(baseSc);
       }
+      let emissiveBoost = 0;
       if (d.elite && d.eliteVariant && d.telegraphTimer > 0) {
-        d.mesh.material.emissiveIntensity = d.baseEmissiveIntensity + 1.15;
+        emissiveBoost = 1.15;
       } else if (!d.elite && d.behaviorType === DRONE_TYPE_SHOOTER) {
         const atk =
           d.aiState === 'aiming' || d.aiState === 'attacking';
-        d.mesh.material.emissiveIntensity =
-          d.baseEmissiveIntensity + (atk ? DRONE_ATTACKING_EMISSIVE_BOOST : 0);
-      } else if (d.elite && d.eliteVariant) {
-        d.mesh.material.emissiveIntensity = d.baseEmissiveIntensity;
+        emissiveBoost = atk ? DRONE_ATTACKING_EMISSIVE_BOOST : 0;
+      }
+      const nMat = d.droneMaterials.length;
+      for (let mi = 0; mi < nMat; mi++) {
+        const m = d.droneMaterials[mi];
+        const mul = mi === 0 ? 1 : 0.78;
+        m.emissiveIntensity = d.baseEmissiveIntensity * mul + emissiveBoost;
       }
       if (d.aimInAttackBand) {
         d.mesh.lookAt(playerTarget.position);
+        if (d.visualRig) d.visualRig.rotation.set(0, 0, 0);
+      } else if (d.visualRig) {
+        d.mesh.rotation.set(0, 0, 0);
+        const t = performance.now() * 0.001;
+        d.visualRig.rotation.y = t * 0.42 + d.id * 0.73;
+        d.visualRig.rotation.x = Math.sin(t * 0.55 + d.id * 0.31) * 0.075;
       }
     }
   }
