@@ -25,6 +25,9 @@ import {
   COLLISION_GROUP_FUSION_B,
   COLLISION_GROUP_PLAYER_BODY,
   COLLISION_MASK_ENEMY_PROJECTILE,
+  DRONE_TYPE_CHASER,
+  DRONE_TYPE_ORBITER,
+  DRONE_TYPE_SHOOTER,
   ELITE_SPAWN_EVERY_NORMAL_KILLS,
   EXPLOSIVE_ARM_DELAY_MS,
   EXPLOSIVE_CUBE_BLAST_RADIUS,
@@ -83,7 +86,8 @@ import {
   PROJ_VISUAL_SCALE,
   PULL_GAIN,
   PULL_MAX_SPEED,
-  SPAWN_INTERVAL,
+  SPAWN_RING_INNER,
+  SPAWN_RING_OUTER,
   TEST_MG_A,
   TEST_MG_B,
   TEST_MG_FIRE_INTERVAL,
@@ -96,6 +100,9 @@ import {
   VORTEX_MAX_CAPTURED,
   VORTEX_ORBIT_R,
   VORTEX_RADIUS,
+  WAVE_BANNER_DURATION_MS,
+  WAVE_BETWEEN_MAX_SEC,
+  WAVE_BETWEEN_MIN_SEC,
 } from './src/config/constants.js';
 
 const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -28, 0) });
@@ -113,6 +120,11 @@ const camera = new THREE.PerspectiveCamera(
   200
 );
 camera.position.set(0, PLAYER_EYE_HEIGHT, 8);
+scene.add(camera);
+
+const muzzle = new THREE.Object3D();
+camera.add(muzzle);
+muzzle.position.set(0, -0.2, -1.5);
 
 /** Referencia invisible que sigue a la cámara: puntería de drones y vector de disparo. */
 const playerTarget = new THREE.Object3D();
@@ -355,11 +367,23 @@ const hudKillsEl = document.getElementById('hudKills');
 const hudTimeEl = document.getElementById('hudTime');
 const hudWaveEl = document.getElementById('hudWave');
 const hudLivesEl = document.getElementById('hudLives');
+const waveBannerEl = document.getElementById('waveBanner');
+const wavePrepareEl = document.getElementById('wavePrepare');
 const gameOverOverlayEl = document.getElementById('gameOverOverlay');
 const gameOverScoreEl = document.getElementById('gameOverScore');
 
 let isGameOver = false;
 let enemiesDefeated = 0;
+/** Olas por eventos (no por kills acumulados). */
+const waveState = {
+  currentWave: 0,
+  enemiesRemainingInWave: 0,
+  isWaveActive: false,
+  isBetweenWaves: false,
+  waveStartTime: 0,
+  betweenTimer: 0,
+};
+let tryWaveEndCheck = () => {};
 /** Solo normales: cada N derrotados aparece un élite. */
 let normalKillsForElite = 0;
 let gameTimeSec = 0;
@@ -375,7 +399,7 @@ function formatTimeMMSS(totalSec) {
 function updateGameHud() {
   if (hudKillsEl) hudKillsEl.textContent = `Derrotados: ${enemiesDefeated}`;
   if (hudTimeEl) hudTimeEl.textContent = formatTimeMMSS(gameTimeSec);
-  const wave = Math.floor(enemiesDefeated / 10) + 1;
+  const wave = Math.max(1, waveState.currentWave || 1);
   if (hudWaveEl) hudWaveEl.textContent = `Ola ${wave}`;
   if (hudLivesEl) {
     hudLivesEl.textContent = '♥'.repeat(Math.max(0, playerLives));
@@ -585,15 +609,22 @@ const {
   addCombatShake: (amp) => addEliteCombatShake(amp),
   onDroneKill(drone, { requestEliteSpawn }) {
     enemiesDefeated += 1;
+    if (waveState.isWaveActive) {
+      waveState.enemiesRemainingInWave -= 1;
+    }
     if (!drone.elite) {
       normalKillsForElite += 1;
       if (
         normalKillsForElite % ELITE_SPAWN_EVERY_NORMAL_KILLS === 0 &&
         !isGameOver
       ) {
+        if (waveState.isWaveActive) {
+          waveState.enemiesRemainingInWave += 1;
+        }
         requestEliteSpawn();
       }
     }
+    tryWaveEndCheck();
     updateGameHud();
   },
 });
@@ -615,7 +646,46 @@ const _worldUpY = new THREE.Vector3(0, 1, 0);
 const _vortexPt = new THREE.Vector3();
 const _vortexSlot = new THREE.Vector3();
 const _vortexLaunchDir = new THREE.Vector3();
+const _crosshairRayTarget = new THREE.Vector3();
+const _muzzleWorldPos = new THREE.Vector3();
+const _convergeForward = new THREE.Vector3();
 const _fusionMid = new THREE.Vector3();
+
+/** Punto fijo en el rayo de la mira (sin raycast; estable). */
+function getCrosshairConvergeTarget(out) {
+  camera.getWorldDirection(_convergeForward);
+  return out.copy(camera.position).addScaledVector(_convergeForward, 50);
+}
+
+/** Dirección desde el cañón (muzzle) hacia el target; evita disparos hacia atrás. */
+function setLaunchDirFromMuzzleToTarget(targetVec, outDir) {
+  muzzle.getWorldPosition(_muzzleWorldPos);
+  outDir.subVectors(targetVec, _muzzleWorldPos);
+  if (outDir.lengthSq() < 1e-10) {
+    camera.getWorldDirection(outDir);
+  } else {
+    outDir.normalize();
+  }
+  camera.getWorldDirection(_convergeForward);
+  if (outDir.dot(_convergeForward) < 0) {
+    outDir.copy(_convergeForward);
+  }
+}
+
+/** Alinea física y malla al punto de disparo (reduce desfase al moverse lateralmente). */
+function snapLaunchBodyToMuzzle(body) {
+  muzzle.getWorldPosition(_muzzleWorldPos);
+  body.position.set(_muzzleWorldPos.x, _muzzleWorldPos.y, _muzzleWorldPos.z);
+  body.velocity.set(0, 0, 0);
+  body.angularVelocity.set(0, 0, 0);
+  const pe = body.userData?.projectileEnt;
+  if (pe?.group) {
+    pe.group.position.copy(_muzzleWorldPos);
+  } else {
+    const cube = cubeMeshes.find((m) => m.userData.body === body);
+    if (cube) cube.position.copy(_muzzleWorldPos);
+  }
+}
 const _plasmaFireDir = new THREE.Vector3();
 const fusionLinePositions = new Float32Array(6);
 const fusionLineGeo = new THREE.BufferGeometry();
@@ -843,12 +913,13 @@ function getVortexWorldPoint(out) {
 }
 
 /** Clic derecho con escudo: lanza todo el vórtice hacia la mira (mismo criterio que telequinesis al soltar). */
-function launchVortexContentsAlongAim(dir) {
-  const inv = dir.length();
-  if (inv < 1e-6) return;
-  const nx = dir.x / inv;
-  const ny = dir.y / inv;
-  const nz = dir.z / inv;
+function launchVortexContentsAlongAim() {
+  getCrosshairConvergeTarget(_crosshairRayTarget);
+  setLaunchDirFromMuzzleToTarget(_crosshairRayTarget, _vortexLaunchDir);
+  const nx = _vortexLaunchDir.x;
+  const ny = _vortexLaunchDir.y;
+  const nz = _vortexLaunchDir.z;
+
   const list = capturedObjects.slice();
   capturedObjects.length = 0;
   fusionPairCursor = 0;
@@ -863,6 +934,7 @@ function launchVortexContentsAlongAim(dir) {
     if (!c.body || grabbedBody === c.body) continue;
     clearVortexTransparencyIfNotGrabbed(c);
     const b = c.body;
+    snapLaunchBodyToMuzzle(b);
     b.wakeUp();
     if (c.kind === 'cube' && c.mesh) {
       c.mesh.userData.vortexImmuneUntil = now + VORTEX_LAUNCH_IMMUNE_MS;
@@ -1107,16 +1179,25 @@ function completeMagneticFusion(entryA, entryB) {
       handShakeY += (Math.random() - 0.5) * 6;
       return;
     }
-    camera.getWorldDirection(_plasmaFireDir);
-    if (_plasmaFireDir.lengthSq() < 1e-6) {
-      _plasmaFireDir.set(0, 0, -1);
+    muzzle.getWorldPosition(_muzzleWorldPos);
+    getCrosshairConvergeTarget(_crosshairRayTarget);
+    _plasmaFireDir.subVectors(_crosshairRayTarget, _muzzleWorldPos);
+    if (_plasmaFireDir.lengthSq() < 1e-10) {
+      camera.getWorldDirection(_plasmaFireDir);
     } else {
       _plasmaFireDir.normalize();
     }
+    camera.getWorldDirection(_convergeForward);
+    if (_plasmaFireDir.dot(_convergeForward) < 0) {
+      _plasmaFireDir.copy(_convergeForward);
+    }
+    const mx = _muzzleWorldPos.x;
+    const my = _muzzleWorldPos.y;
+    const mz = _muzzleWorldPos.z;
     const plasmaEnt = createPlasmaBolt(
-      x,
-      y,
-      z,
+      mx,
+      my,
+      mz,
       _plasmaFireDir.x,
       _plasmaFireDir.y,
       _plasmaFireDir.z,
@@ -1457,6 +1538,127 @@ addEliteCombatShake = (amp = 0.55) => {
   fusionCameraShake.y += (Math.random() - 0.5) * 1.2 * amp;
   fusionCameraShake.z += (Math.random() - 0.5) * 2 * amp;
 };
+
+function waveShakeCamera() {
+  fusionCameraShake.x += (Math.random() - 0.5) * 1.1;
+  fusionCameraShake.y += (Math.random() - 0.5) * 0.65;
+  fusionCameraShake.z += (Math.random() - 0.5) * 1.1;
+}
+
+function randomSpawnPointAroundPlayerForWave(kind) {
+  const angle = Math.random() * Math.PI * 2;
+  const inner =
+    kind === 'near' ? SPAWN_RING_INNER : SPAWN_RING_INNER + 8;
+  const outer =
+    kind === 'far' ? SPAWN_RING_OUTER : SPAWN_RING_INNER + 14;
+  const dist = inner + Math.random() * (outer - inner);
+  const pt = playerTarget.position;
+  let x = pt.x + Math.cos(angle) * dist;
+  let z = pt.z + Math.sin(angle) * dist;
+  const y = 0.9 + Math.random() * 5;
+  x = THREE.MathUtils.clamp(x, -ARENA_HALF, ARENA_HALF);
+  z = THREE.MathUtils.clamp(z, -ARENA_HALF, ARENA_HALF);
+  return { x, y, z };
+}
+
+function getWaveComposition(waveNum) {
+  const n = Math.min(24, 5 + waveNum * 2 + Math.floor(waveNum / 3));
+  let shooters = 0;
+  if (waveNum >= 3) {
+    shooters = Math.min(6, 1 + Math.floor((waveNum - 2) / 2));
+  }
+  if (waveNum >= 6) shooters += 1;
+  shooters = Math.min(shooters, Math.floor(n * 0.35));
+  let orbiters = Math.max(2, Math.floor(n * 0.32));
+  let chasers = n - orbiters - shooters;
+  chasers = Math.max(2, chasers);
+  shooters = Math.max(0, Math.min(shooters, n - chasers - orbiters));
+  const total = chasers + orbiters + shooters;
+  return { chasers, orbiters, shooters, total };
+}
+
+function spawnWaveEnemies(waveNum) {
+  const alive = () => drones.filter((d) => !d.dying).length;
+  const comp = getWaveComposition(waveNum);
+  let spawned = 0;
+  const trySpawn = (type, kind) => {
+    if (alive() >= MAX_DRONES) return;
+    const p = randomSpawnPointAroundPlayerForWave(kind);
+    createDrone(p.x, p.y, p.z, { behaviorType: type });
+    spawned += 1;
+  };
+  for (let i = 0; i < comp.chasers; i++) trySpawn(DRONE_TYPE_CHASER, 'near');
+  for (let i = 0; i < comp.orbiters; i++) trySpawn(DRONE_TYPE_ORBITER, 'near');
+  for (let i = 0; i < comp.shooters; i++) trySpawn(DRONE_TYPE_SHOOTER, 'far');
+  return spawned;
+}
+
+function showWaveBannerWave(waveNum) {
+  if (!waveBannerEl) return;
+  waveBannerEl.textContent = `OLA ${waveNum}`;
+  waveBannerEl.setAttribute('aria-hidden', 'false');
+  waveBannerEl.classList.add('wave-banner-show');
+  setTimeout(() => {
+    waveBannerEl.classList.remove('wave-banner-show');
+    waveBannerEl.setAttribute('aria-hidden', 'true');
+  }, WAVE_BANNER_DURATION_MS);
+}
+
+function setPrepareVisible(visible) {
+  if (!wavePrepareEl) return;
+  if (visible) {
+    wavePrepareEl.textContent = 'PREPARA…';
+    wavePrepareEl.classList.add('wave-prepare-show');
+    wavePrepareEl.setAttribute('aria-hidden', 'false');
+  } else {
+    wavePrepareEl.classList.remove('wave-prepare-show');
+    wavePrepareEl.setAttribute('aria-hidden', 'true');
+  }
+}
+
+function endWave() {
+  if (!waveState.isWaveActive) return;
+  waveState.isWaveActive = false;
+  waveState.isBetweenWaves = true;
+  waveState.betweenTimer =
+    WAVE_BETWEEN_MIN_SEC +
+    Math.random() * (WAVE_BETWEEN_MAX_SEC - WAVE_BETWEEN_MIN_SEC);
+  setPrepareVisible(true);
+  updateGameHud();
+}
+
+function startWave(waveNum) {
+  waveState.currentWave = waveNum;
+  waveState.isWaveActive = true;
+  waveState.isBetweenWaves = false;
+  waveState.waveStartTime = performance.now();
+  setPrepareVisible(false);
+  const spawned = spawnWaveEnemies(waveNum);
+  waveState.enemiesRemainingInWave = spawned;
+  showWaveBannerWave(waveNum);
+  waveShakeCamera();
+  updateGameHud();
+}
+
+function updateWaveSystem(dt) {
+  if (waveState.isBetweenWaves) {
+    waveState.betweenTimer -= dt;
+    if (waveState.betweenTimer <= 0) {
+      startWave(waveState.currentWave + 1);
+    }
+    return;
+  }
+  tryWaveEndCheck();
+}
+
+tryWaveEndCheck = () => {
+  if (!waveState.isWaveActive) return;
+  const alive = drones.filter((d) => !d.dying).length;
+  if (waveState.enemiesRemainingInWave <= 0 && alive === 0) {
+    endWave();
+  }
+};
+
 /** Esfera invisible (solo THREE): escala con el radio del barrido de daño. */
 const COMBO_EXPLOSION_PROBE_GEO = new THREE.SphereGeometry(1, 22, 16);
 const COMBO_EXPLOSION_PROBE_MAT = new THREE.MeshBasicMaterial({
@@ -2474,7 +2676,7 @@ function updateBulletTimeAndPhysicsScale() {
   physicsTimeScale = near ? BULLET_TIME_SCALE : 1;
 }
 
-let spawnTimer = 0;
+let waveSystemBootstrapped = false;
 let testMgTimerA = 0;
 let testMgTimerB = 0;
 
@@ -2610,8 +2812,7 @@ window.addEventListener('mousedown', (e) => {
   if (isPaused || e.button !== 2 || !controls.isLocked) return;
   if (shieldPressed && capturedObjects.length > 0) {
     physicsTimeScale = 1;
-    camera.getWorldDirection(_vortexLaunchDir);
-    launchVortexContentsAlongAim(_vortexLaunchDir);
+    launchVortexContentsAlongAim();
     handExtendedUntil = performance.now() + HAND_EXTENDED_MS;
     handShakeX += (Math.random() - 0.5) * 8;
     handShakeY += HAND_KICK_Y * 0.5;
@@ -2674,8 +2875,10 @@ window.addEventListener('mouseup', (e) => {
     if (mesh) clearGrabTransparency(mesh);
   }
   if (grabbedBody && controls.isLocked) {
-    const dir = new THREE.Vector3();
-    camera.getWorldDirection(dir);
+    getCrosshairConvergeTarget(_crosshairRayTarget);
+    const dir = _vortexLaunchDir;
+    setLaunchDirFromMuzzleToTarget(_crosshairRayTarget, dir);
+    snapLaunchBodyToMuzzle(grabbedBody);
     const pe = grabbedBody.userData?.projectileEnt;
     if (pe) {
       pe.pathTraveled = 0;
@@ -2697,6 +2900,7 @@ window.addEventListener('mouseup', (e) => {
     const launchSpeed = pe
       ? LAUNCH_SPEED * LAUNCH_PROJECTILE_MULT
       : LAUNCH_SPEED;
+    grabbedBody.wakeUp();
     grabbedBody.velocity.set(
       dir.x * launchSpeed,
       dir.y * launchSpeed,
@@ -2879,15 +3083,11 @@ function animate() {
 
   if (controls.isLocked && !isPaused && !isGameOver) {
     if (!TEST_MODE_NO_DRONES) {
-      spawnTimer += dt;
-      if (spawnTimer >= SPAWN_INTERVAL) {
-        spawnTimer = 0;
-        const alive = drones.filter((d) => !d.dying).length;
-        if (alive < MAX_DRONES) {
-          const p = randomSpawnPointAroundPlayer();
-          createDrone(p.x, p.y, p.z);
-        }
+      if (!waveSystemBootstrapped) {
+        waveSystemBootstrapped = true;
+        startWave(1);
       }
+      updateWaveSystem(dt);
     }
     if (TEST_MODE_DUAL_MG) {
       const tx = camera.position.x;
@@ -2919,7 +3119,6 @@ function animate() {
       }
     }
   } else if (!controls.isLocked || isGameOver) {
-    spawnTimer = 0;
     testMgTimerA = 0;
     testMgTimerB = 0;
   }

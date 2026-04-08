@@ -121,6 +121,11 @@ export const CUBE_KILL_DRONE_SPEED = 16;
 export const DRONE_DEATH_SHRINK_SPEED = 7;
 export const DRONE_FLASH_SEC = 0.12;
 export const MAX_DRONES = 36;
+/** Pausa entre olas (s). */
+export const WAVE_BETWEEN_MIN_SEC = 1.5;
+export const WAVE_BETWEEN_MAX_SEC = 3;
+/** Cartel central “WAVE N” visible (ms). */
+export const WAVE_BANNER_DURATION_MS = 1200;
 /** Enemigo élite: más grande, escudo morado; solo muere por explosión de combinación. */
 export const ELITE_DRONE_RADIUS = 0.62;
 export const ELITE_DRONE_MASS = 1.05;
