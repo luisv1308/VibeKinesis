@@ -188,6 +188,22 @@
         font-size: 13px;
         letter-spacing: 0.04em;
       }
+      #hudObjectiveArrow {
+        position: fixed;
+        left: 50%;
+        bottom: 26%;
+        width: 0;
+        height: 0;
+        margin-left: 0;
+        border-left: 11px solid transparent;
+        border-right: 11px solid transparent;
+        border-bottom: 18px solid rgba(120, 255, 200, 0.82);
+        filter: drop-shadow(0 0 10px rgba(80, 220, 160, 0.55));
+        transform-origin: 50% 65%;
+        pointer-events: none;
+        z-index: 5;
+        display: none;
+      }
       #minimapWrap {
         position: fixed;
         bottom: 16px;
@@ -326,6 +342,7 @@
         </button>
       </div>
     </div>
+    <div id="hudObjectiveArrow" aria-hidden="true"></div>
     <div id="wavePrepare" aria-hidden="true"></div>
     <div id="waveBanner" aria-hidden="true"></div>
     <div id="pauseOverlay" aria-hidden="true">PAUSA · P</div>

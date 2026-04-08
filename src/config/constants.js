@@ -24,6 +24,12 @@ export const SCORE_PER_KILL_BASE = 100;
 /** Incremento del multiplicador por kill consecutivo sin recibir daño. */
 export const COMBO_MULT_PER_KILL = 0.12;
 export const COMBO_MULT_MAX = 3.5;
+/** Si la stamina está por debajo de esta fracción al matar, el combo sube más (riesgo/recompensa). */
+export const LOW_STAMINA_KILL_BONUS_THRESHOLD = 0.22;
+/** Multiplicador extra sobre COMBO_MULT_PER_KILL con stamina baja. */
+export const LOW_STAMINA_KILL_COMBO_MULT = 1.35;
+/** Cada cuántas oleadas (a partir de la 2) rota un mutador de dificultad. */
+export const WAVE_MUTATOR_INTERVAL = 4;
 /** Radio horizontal para empujar al jugador fuera de muros del laberinto. */
 export const PLAYER_WALL_RADIUS = 0.48;
 /** Alcance máximo del rayo de telequinesis (más pequeño = “escudo” más ajustado). */

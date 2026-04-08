@@ -79,6 +79,7 @@ export function createDronesSystem(deps) {
     addCombatShake = () => {},
     onDroneKill,
     getSpawnClampHalf = () => ARENA_HALF,
+    getWaveEnemySpeedMult = () => 1,
   } = deps;
 
   const eliteShieldGeo = new THREE.SphereGeometry(1, 18, 18);
@@ -503,6 +504,20 @@ export function createDronesSystem(deps) {
     const allowElite = opts.allowEliteKill === true;
     if (drone.dying) return;
     if (drone.elite && !allowElite && drone.eliteHp > 0) return;
+    const pt = playerTarget.position;
+    const bx = drone.body.position.x;
+    const bz = drone.body.position.z;
+    let kx = bx - pt.x;
+    let kz = bz - pt.z;
+    let klen = Math.hypot(kx, kz);
+    if (klen < 0.08) {
+      kx = 1;
+      kz = 0;
+      klen = 1;
+    }
+    const kick = 5.8;
+    drone.deathKickVx = (kx / klen) * kick;
+    drone.deathKickVz = (kz / klen) * kick;
     drone.dying = true;
     drone.deathPhase = 0;
     world.removeBody(drone.body);
@@ -549,6 +564,8 @@ export function createDronesSystem(deps) {
     lastPx = px;
     lastPz = pz;
     haveLastPlayer = true;
+
+    const waveSM = getWaveEnemySpeedMult();
 
     const orbiters = [];
     for (const d of drones) {
@@ -636,7 +653,9 @@ export function createDronesSystem(deps) {
 
     const fireBasic = (d, b) => {
       if (isShotBlocked(d, b, px, py, pz)) return;
-      createEnemyProjectile(b.position.x, b.position.y, b.position.z, px, py, pz);
+      createEnemyProjectile(b.position.x, b.position.y, b.position.z, px, py, pz, {
+        speedMult: waveSM,
+      });
     };
 
     const fireShooter = (drone, b) => {
@@ -649,7 +668,7 @@ export function createDronesSystem(deps) {
         px,
         py,
         pz,
-        { jitter: DRONE_SHOOTER_AIM_JITTER }
+        { jitter: DRONE_SHOOTER_AIM_JITTER, speedMult: waveSM }
       );
     };
 
@@ -719,7 +738,7 @@ export function createDronesSystem(deps) {
                   py,
                   pz,
                   {
-                    speedMult: DRONE_ELITE_SNIPER_SHOT_SPEED_MULT,
+                    speedMult: DRONE_ELITE_SNIPER_SHOT_SPEED_MULT * waveSM,
                     jitter: 0.03,
                   }
                 );
@@ -751,7 +770,7 @@ export function createDronesSystem(deps) {
                   const txb = ox0 + Math.cos(ang) * 12;
                   const tzb = oz0 + Math.sin(ang) * 12;
                   createEnemyProjectile(ox0, oy0, oz0, txb, py, tzb, {
-                    speedMult: DRONE_ELITE_BURST_SPEED_MULT,
+                    speedMult: DRONE_ELITE_BURST_SPEED_MULT * waveSM,
                   });
                 }
                 addCombatShake(0.65);
@@ -1026,8 +1045,8 @@ export function createDronesSystem(deps) {
       ) {
         if (hDist > 0.08) {
           const inv = 1 / hDist;
-          b.velocity.x = hdx * inv * DRONE_ELITE_CHARGE_SPEED;
-          b.velocity.z = hdz * inv * DRONE_ELITE_CHARGE_SPEED;
+          b.velocity.x = hdx * inv * DRONE_ELITE_CHARGE_SPEED * waveSM;
+          b.velocity.z = hdz * inv * DRONE_ELITE_CHARGE_SPEED * waveSM;
         } else {
           b.velocity.x = 0;
           b.velocity.z = 0;
@@ -1071,9 +1090,9 @@ export function createDronesSystem(deps) {
         nz += sz * invS * DRONE_SEPARATION_WEIGHT;
       }
       const flen = Math.sqrt(nx * nx + nz * nz);
-      let effSpeed = moveSpeed;
+      let effSpeed = moveSpeed * waveSM;
       if (moveSpeed < 0.05 && flen > 0.02) {
-        effSpeed = Math.max(moveSpeed, 2.1);
+        effSpeed = Math.max(moveSpeed * waveSM, 2.1 * waveSM);
       }
       if (flen > 0.02) {
         const invF = 1 / flen;
@@ -1091,6 +1110,13 @@ export function createDronesSystem(deps) {
     for (let i = drones.length - 1; i >= 0; i--) {
       const d = drones[i];
       if (!d.dying) continue;
+      if (d.deathKickVx != null) {
+        d.mesh.position.x += d.deathKickVx * dt;
+        d.mesh.position.z += d.deathKickVz * dt;
+        const damp = Math.pow(0.84, dt * 60);
+        d.deathKickVx *= damp;
+        d.deathKickVz *= damp;
+      }
       d.deathPhase += dt;
       if (d.deathPhase < DRONE_FLASH_SEC) {
         const t = d.deathPhase / DRONE_FLASH_SEC;

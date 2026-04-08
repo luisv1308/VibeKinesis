@@ -6,6 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import * as CANNON from 'cannon-es';
 import { createDronesSystem } from './src/game/drones.js';
 import { createMissionTurretSystem } from './src/game/missionTurrets.js';
+import { juiceSfx, ensureJuiceAudioContext } from './src/game/juiceSfx.js';
 import {
   ARENA_HALF,
   MISSION_ARENA_HALF,
@@ -24,6 +25,9 @@ import {
   COLLISION_MASK_ENEMY_PROJECTILE,
   COMBO_MULT_MAX,
   COMBO_MULT_PER_KILL,
+  LOW_STAMINA_KILL_BONUS_THRESHOLD,
+  LOW_STAMINA_KILL_COMBO_MULT,
+  WAVE_MUTATOR_INTERVAL,
   DRONE_TYPE_CHASER,
   DRONE_TYPE_ORBITER,
   DRONE_TYPE_SHOOTER,
@@ -204,8 +208,14 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0c0c14);
 scene.fog = new THREE.Fog(0x0c0c14, 25, 90);
 
+const PLAYER_BASE_FOV = 75;
+let juiceFovKick = 0;
+function punchJuiceFov(amount) {
+  juiceFovKick = Math.min(11, juiceFovKick + amount);
+}
+
 const camera = new THREE.PerspectiveCamera(
-  75,
+  PLAYER_BASE_FOV,
   window.innerWidth / window.innerHeight,
   0.1,
   520
@@ -468,6 +478,7 @@ const hudTimeEl = document.getElementById('hudTime');
 const hudWaveEl = document.getElementById('hudWave');
 const hudMissionEl = document.getElementById('hudMission');
 const hudObjectiveEl = document.getElementById('hudObjective');
+const hudObjectiveArrowEl = document.getElementById('hudObjectiveArrow');
 const minimapWrap = document.getElementById('minimapWrap');
 const minimapCanvas = document.getElementById('minimapCanvas');
 const minimapCtx = minimapCanvas?.getContext('2d');
@@ -491,6 +502,12 @@ const waveState = {
   isBetweenWaves: false,
   waveStartTime: 0,
   betweenTimer: 0,
+  /** Solo modo olas: multiplicador de velocidad enemiga / proyectiles. */
+  enemySpeedMult: 1,
+  /** Tiradores extra en composición de la oleada. */
+  shootersSpawnBias: 0,
+  /** Texto corto del mutador activo (HUD). */
+  mutatorLabel: '',
 };
 let tryWaveEndCheck = () => {};
 /** Solo normales: cada N derrotados aparece un élite. */
@@ -517,6 +534,9 @@ function resetWaveState() {
   waveState.isBetweenWaves = false;
   waveState.waveStartTime = 0;
   waveState.betweenTimer = 0;
+  waveState.enemySpeedMult = 1;
+  waveState.shootersSpawnBias = 0;
+  waveState.mutatorLabel = '';
 }
 let gameTimeSec = 0;
 let playerLives = 3;
@@ -548,11 +568,11 @@ function getMissionObjectiveHudText() {
   if (gameMode !== 'mission') return '';
   switch (missionObjectiveState.state) {
     case 'idle':
-      return 'Objetivo: recoger paquete (E)';
+      return 'Ve al marcador naranja y pulsa E para coger el paquete.';
     case 'carried':
-      return 'Objetivo: llevar a extracción (E)';
+      return 'Lleva el paquete a la zona de extracción (anillo verde) y pulsa E.';
     case 'delivered':
-      return 'Paquete entregado';
+      return 'Paquete entregado. Elimina hostiles restantes.';
     default:
       return '';
   }
@@ -601,6 +621,9 @@ function tryMissionObjectiveInteractMaybe() {
       scene.remove(m);
       m.position.set(0.42, -0.22, -0.52);
       camera.add(m);
+      juiceSfx.missionPickup();
+      punchJuiceFov(2.2);
+      addEliteCombatShake(0.14);
       updateGameHud();
       return true;
     }
@@ -617,6 +640,9 @@ function tryMissionObjectiveInteractMaybe() {
         ez
       );
       scene.add(m);
+      juiceSfx.missionDeliver();
+      punchJuiceFov(3);
+      addEliteCombatShake(0.22);
       updateGameHud();
       return true;
     }
@@ -642,7 +668,11 @@ function updateGameHud() {
     } else if (gameMode === 'menu') {
       hudWaveEl.textContent = '—';
     } else {
-      hudWaveEl.textContent = `Ola ${wave}`;
+      const mut =
+        waveState.mutatorLabel && wave >= 2
+          ? ` · ${waveState.mutatorLabel}`
+          : '';
+      hudWaveEl.textContent = `Ola ${wave}${mut}`;
     }
   }
   if (hudLivesEl) {
@@ -717,6 +747,7 @@ function onPlayerHit() {
 }
 
 document.addEventListener('click', () => {
+  ensureJuiceAudioContext();
   if (isGameOver) return;
   if (gameMode === 'menu') return;
   if (!controls.isLocked) {
@@ -743,6 +774,7 @@ function applyBlockerCopyForMode() {
 }
 
 function selectGameMode(mode) {
+  ensureJuiceAudioContext();
   gameMode = mode;
   if (mode === 'mission') buildMissionArena();
   else if (mode === 'waves') buildWavesArena();
@@ -782,6 +814,7 @@ function resetPlayerSpawn() {
 }
 
 controls.addEventListener('lock', () => {
+  ensureJuiceAudioContext();
   blocker.classList.add('hidden');
 });
 
@@ -950,6 +983,11 @@ function disposeMissionExtraObject(obj) {
   scene.remove(obj);
   obj.traverse((ch) => {
     if (ch.geometry) ch.geometry.dispose();
+    const mat = ch.material;
+    if (mat) {
+      if (Array.isArray(mat)) mat.forEach((m) => m.dispose?.());
+      else mat.dispose?.();
+    }
   });
 }
 
@@ -1348,12 +1386,34 @@ function buildMissionInterior() {
 
   addDestructibleWall(38, y0, 18, 1.15, halfH, 0.5);
   addDestructibleWall(-42, y0, -22, 0.45, halfH, 2.4);
+  /** Atajo: muro que tapa pasillo; al romperlo entras en línea de la torreta. */
+  addDestructibleWall(18, y0, -74, 0.52, halfH, 3.15);
+  missionTurretSystem.spawnMissionTurret(32, 0, -74);
 
   missionTurretSystem.spawnMissionTurret(52, 0, -38);
   missionTurretSystem.spawnMissionTurret(-68, 0, 82);
   missionTurretSystem.spawnMissionTurret(-20, 5.55, 96);
 
   buildMissionObjectiveEntity();
+
+  {
+    const ex = missionObjectiveState.extract.x;
+    const ez = missionObjectiveState.extract.z;
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(4.6, 5.35, 40),
+      new THREE.MeshBasicMaterial({
+        color: 0x55ee99,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(ex, 0.055, ez);
+    scene.add(ring);
+    missionVisualExtras.push(ring);
+  }
 
   const grid = new THREE.GridHelper(340, 34, 0x5590c8, 0x3a5060);
   grid.position.y = 0.02;
@@ -1539,17 +1599,23 @@ const {
   playerBody,
   lineOfSightBlocked: missionPhysicsLineOfSightBlocked,
   getSpawnClampHalf: getActiveArenaHalf,
+  getWaveEnemySpeedMult: () =>
+    gameMode === 'waves' ? waveState.enemySpeedMult : 1,
   getCubeMeshes: () => cubeMeshes,
   createEnemyProjectile: (...a) => createEnemyProjectileRef(...a),
   addCombatShake: (amp) => addEliteCombatShake(amp),
   onDroneKill(drone, { requestEliteSpawn }) {
     enemiesDefeated += 1;
+    juiceSfx.killDrone();
+    punchJuiceFov(drone.elite ? 2.8 : 1.35);
+    addEliteCombatShake(drone.elite ? 0.22 : 0.11);
     const pts = Math.floor(SCORE_PER_KILL_BASE * comboMultiplier);
     gameScore += pts;
-    comboMultiplier = Math.min(
-      COMBO_MULT_MAX,
-      comboMultiplier + COMBO_MULT_PER_KILL
-    );
+    let comboInc = COMBO_MULT_PER_KILL;
+    if (stamina / STAMINA_MAX < LOW_STAMINA_KILL_BONUS_THRESHOLD) {
+      comboInc *= LOW_STAMINA_KILL_COMBO_MULT;
+    }
+    comboMultiplier = Math.min(COMBO_MULT_MAX, comboMultiplier + comboInc);
     if (waveState.isWaveActive) {
       waveState.enemiesRemainingInWave -= 1;
     }
@@ -1601,6 +1667,9 @@ function spawnMissionPatrol() {
 }
 
 function showMissionCompleteBanner() {
+  juiceSfx.victory();
+  punchJuiceFov(4);
+  addEliteCombatShake(0.45);
   if (!waveBannerEl) return;
   waveBannerEl.textContent = 'SECTOR LIMPIO';
   waveBannerEl.setAttribute('aria-hidden', 'false');
@@ -2152,6 +2221,10 @@ function completeMagneticFusion(entryA, entryB) {
   clearFusionActiveGlow();
   clearFusionPreviewGlow();
 
+  juiceSfx.fusion();
+  punchJuiceFov(2.2);
+  addEliteCombatShake(0.16);
+
   if (entryA.kind === 'cube') {
     removeCubeMesh(entryA.mesh);
   } else if (entryA.projectileEnt && !entryA.projectileEnt.dead) {
@@ -2579,8 +2652,32 @@ function getWaveComposition(waveNum) {
   let chasers = n - orbiters - shooters;
   chasers = Math.max(2, chasers);
   shooters = Math.max(0, Math.min(shooters, n - chasers - orbiters));
+  const bias = waveState.shootersSpawnBias | 0;
+  if (bias > 0) {
+    shooters = Math.min(shooters + bias, n - orbiters - 2);
+    chasers = Math.max(2, n - orbiters - shooters);
+  }
   const total = chasers + orbiters + shooters;
   return { chasers, orbiters, shooters, total };
+}
+
+function applyWaveMutatorForWave(waveNum) {
+  waveState.enemySpeedMult = 1;
+  waveState.shootersSpawnBias = 0;
+  waveState.mutatorLabel = '';
+  if (waveNum < 2) return;
+  const phase = Math.floor((waveNum - 1) / WAVE_MUTATOR_INTERVAL) % 3;
+  if (phase === 0) {
+    waveState.enemySpeedMult = 1.12;
+    waveState.mutatorLabel = 'Hostiles rápidos';
+  } else if (phase === 1) {
+    waveState.shootersSpawnBias = 3;
+    waveState.mutatorLabel = '+ Tiradores';
+  } else {
+    waveState.enemySpeedMult = 1.07;
+    waveState.shootersSpawnBias = 1;
+    waveState.mutatorLabel = 'Presión mixta';
+  }
 }
 
 function spawnWaveEnemies(waveNum) {
@@ -2638,6 +2735,7 @@ function startWave(waveNum) {
   waveState.isWaveActive = true;
   waveState.isBetweenWaves = false;
   waveState.waveStartTime = performance.now();
+  applyWaveMutatorForWave(waveNum);
   setPrepareVisible(false);
   const spawned = spawnWaveEnemies(waveNum);
   waveState.enemiesRemainingInWave = spawned;
@@ -2740,6 +2838,7 @@ function spawnFusionExplosionEffects(x, y, z, impactSpeed = 24) {
   fusionCameraShake.x += (Math.random() - 0.5) * 2 * amp;
   fusionCameraShake.y += (Math.random() - 0.5) * 1.2 * amp;
   fusionCameraShake.z += (Math.random() - 0.5) * 2 * amp;
+  punchJuiceFov(THREE.MathUtils.clamp(impactSpeed * 0.11, 1.8, 5.5));
 }
 
 function updateFusionExplosionTriggers(dt) {
@@ -3194,6 +3293,7 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz, opts = {}) {
   world.addBody(body);
   projectileMeshes.push(group);
   enemyProjectiles.push(ent);
+  juiceSfx.enemyShootMaybe();
   return ent;
 }
 createEnemyProjectileRef = createEnemyProjectile;
@@ -3592,6 +3692,8 @@ function updateShieldStuckProjectiles() {
     ent.shieldStuck = true;
     ent.shieldStickU = su;
     ent.shieldStickV = sv;
+    juiceSfx.shieldCatch();
+    punchJuiceFov(0.55);
     removeMagneticCaptureForBody(ent.body);
   }
 
@@ -4113,6 +4215,45 @@ function drawMinimap(fwX, fwZ) {
   minimapWrap.setAttribute('aria-hidden', 'false');
 }
 
+function updateMissionObjectiveHudArrow(fwd) {
+  if (!hudObjectiveArrowEl) return;
+  if (
+    gameMode !== 'mission' ||
+    missionCompleteShown ||
+    missionObjectiveState.state === 'delivered'
+  ) {
+    hudObjectiveArrowEl.style.display = 'none';
+    hudObjectiveArrowEl.setAttribute('aria-hidden', 'true');
+    return;
+  }
+  const px = camera.position.x;
+  const pz = camera.position.z;
+  let tx;
+  let tz;
+  if (missionObjectiveState.state === 'idle') {
+    tx = missionObjectiveState.pickup.x;
+    tz = missionObjectiveState.pickup.z;
+  } else {
+    tx = missionObjectiveState.extract.x;
+    tz = missionObjectiveState.extract.z;
+  }
+  const dx = tx - px;
+  const dz = tz - pz;
+  const fx = fwd.x;
+  const fz = fwd.z;
+  const fl = Math.hypot(fx, fz) || 1;
+  const tl = Math.hypot(dx, dz) || 1;
+  const fnx = fx / fl;
+  const fnz = fz / fl;
+  const tnx = dx / tl;
+  const tnz = dz / tl;
+  const ang =
+    (Math.atan2(tnx, tnz) - Math.atan2(fnx, fnz)) * (180 / Math.PI);
+  hudObjectiveArrowEl.style.display = '';
+  hudObjectiveArrowEl.setAttribute('aria-hidden', 'false');
+  hudObjectiveArrowEl.style.transform = `translateX(-50%) rotate(${ang}deg)`;
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
@@ -4289,6 +4430,15 @@ function animate() {
 
     drawMinimap(forward.x, forward.z);
 
+    if (gameMode === 'mission') {
+      updateMissionObjectiveHudArrow(forward);
+      const om = missionObjectiveState.mesh;
+      if (om && missionObjectiveState.state === 'idle' && om.material) {
+        om.material.emissiveIntensity =
+          0.72 + 0.38 * Math.sin(performance.now() * 0.004);
+      }
+    }
+
     let stDelta = STAMINA_REGEN_PER_SEC;
     if (sprintHeld) {
       stDelta -= STAMINA_DRAIN_SPRINT_PER_SEC;
@@ -4324,6 +4474,9 @@ function animate() {
       }
       grabbedBody.angularVelocity.scale(0.92, grabbedBody.angularVelocity);
     }
+  } else if (hudObjectiveArrowEl) {
+    hudObjectiveArrowEl.style.display = 'none';
+    hudObjectiveArrowEl.setAttribute('aria-hidden', 'true');
   }
 
   if (!isPaused && !isGameOver) {
@@ -4491,6 +4644,9 @@ function animate() {
   fusionCameraShake.x *= _shakeD;
   fusionCameraShake.y *= _shakeD;
   fusionCameraShake.z *= _shakeD;
+  juiceFovKick *= Math.pow(0.88, dt * 60);
+  camera.fov = PLAYER_BASE_FOV + juiceFovKick;
+  camera.updateProjectionMatrix();
   if (!controls.isLocked || isPaused || isGameOver) {
     if (minimapWrap) {
       minimapWrap.style.display = 'none';
