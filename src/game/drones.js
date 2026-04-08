@@ -10,6 +10,7 @@ import {
   DRONE_BURST_COUNT,
   DRONE_BURST_RELOAD,
   DRONE_BURST_SHOT_DELAY,
+  DRONE_CHASER_SPEED_MULT,
   DRONE_DEATH_SHRINK_SPEED,
   DRONE_FIRE_COOLDOWN,
   DRONE_FLASH_SEC,
@@ -19,8 +20,12 @@ import {
   DRONE_ORBIT_ANGULAR_SPEED,
   DRONE_ORBIT_RADIUS_MAX,
   DRONE_ORBIT_RADIUS_MIN,
+  DRONE_ORBITER_ANGULAR_MULT,
+  DRONE_ORBITER_LINEAR_DAMPING,
+  DRONE_ORBITER_RADIUS_MULT,
   DRONE_PERSONAL_OFFSET_RANGE,
   DRONE_RADIUS,
+  DRONE_SHOOTER_FLEE_BOOST,
   DRONE_SHOOTER_IDEAL_DIST,
   DRONE_SHOOTER_SPEED,
   DRONE_TYPE_CHASER,
@@ -282,26 +287,42 @@ export function createDronesSystem(deps) {
       let tz = pz + oz;
       let moveSpeed = DRONE_MAX_SPEED * (d.elite ? 1.2 : 1);
       const bt = d.behaviorType;
+      const baseDamp = d.elite
+        ? DRONE_LINEAR_DAMPING * 0.88
+        : DRONE_LINEAR_DAMPING;
 
       if (bt === DRONE_TYPE_ORBITER) {
-        d.orbitAngle += dt * DRONE_ORBIT_ANGULAR_SPEED * d.orbitDir;
-        const R = d.orbitRadius;
+        b.linearDamping = DRONE_ORBITER_LINEAR_DAMPING;
+        d.orbitAngle +=
+          dt *
+          DRONE_ORBIT_ANGULAR_SPEED *
+          DRONE_ORBITER_ANGULAR_MULT *
+          d.orbitDir;
+        const R = d.orbitRadius * DRONE_ORBITER_RADIUS_MULT;
         tx = px + Math.cos(d.orbitAngle) * R + ox * 0.35;
         tz = pz + Math.sin(d.orbitAngle) * R + oz * 0.35;
-      } else if (bt === DRONE_TYPE_SHOOTER) {
-        moveSpeed = DRONE_SHOOTER_SPEED * (d.elite ? 1.1 : 1);
-        const ideal = DRONE_SHOOTER_IDEAL_DIST;
-        if (hDist > 0.08) {
-          const inv = 1 / hDist;
-          tx = px + hdx * inv * ideal + ox * 0.45;
-          tz = pz + hdz * inv * ideal + oz * 0.45;
-        }
       } else {
-        if (hDist > 0.08 && distToPlayer < DRONE_ATTACK_MIN_DIST) {
-          const inv = 1 / hDist;
-          const ringR = DRONE_ATTACK_MIN_DIST + 2;
-          tx = px + hdx * inv * ringR;
-          tz = pz + hdz * inv * ringR;
+        b.linearDamping = baseDamp;
+        if (bt === DRONE_TYPE_SHOOTER) {
+          moveSpeed = DRONE_SHOOTER_SPEED * (d.elite ? 1.1 : 1);
+          let ideal = DRONE_SHOOTER_IDEAL_DIST;
+          if (hDist > 0.08) {
+            const inv = 1 / hDist;
+            if (hDist < ideal) {
+              ideal += (ideal - hDist) * DRONE_SHOOTER_FLEE_BOOST;
+            }
+            ideal = Math.min(ideal, DRONE_ATTACK_MAX_DIST - 1);
+            tx = px + hdx * inv * ideal + ox * 0.45;
+            tz = pz + hdz * inv * ideal + oz * 0.45;
+          }
+        } else {
+          moveSpeed *= DRONE_CHASER_SPEED_MULT;
+          if (hDist > 0.08 && distToPlayer < DRONE_ATTACK_MIN_DIST) {
+            const inv = 1 / hDist;
+            const ringR = DRONE_ATTACK_MIN_DIST + 2;
+            tx = px + hdx * inv * ringR;
+            tz = pz + hdz * inv * ringR;
+          }
         }
       }
 

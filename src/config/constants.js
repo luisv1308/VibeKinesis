@@ -37,13 +37,20 @@ export const DRONE_TYPE_SHOOTER = 'shooter';
 export const DRONE_BURST_COUNT = 3;
 export const DRONE_BURST_SHOT_DELAY = 0.14;
 export const DRONE_BURST_RELOAD = 2.0;
-/** Tirador: velocidad y distancia preferida al jugador (XZ). */
-export const DRONE_SHOOTER_SPEED = 4.2;
-export const DRONE_SHOOTER_IDEAL_DIST = 16;
-/** Orbitador: radio y velocidad angular (rad/s). */
+/** Tirador: velocidad y distancia preferida al jugador (XZ); huyen un poco más si te acercas. */
+export const DRONE_SHOOTER_SPEED = 3.9;
+export const DRONE_SHOOTER_IDEAL_DIST = 20;
+/** Cuando está más cerca que ideal, suma (ideal − hDist) × este factor a la distancia objetivo. */
+export const DRONE_SHOOTER_FLEE_BOOST = 0.85;
+/** Orbitador: radio algo mayor + giro más lento = trayectoria más suave; damping más alto = menos nervioso. */
 export const DRONE_ORBIT_RADIUS_MIN = 10;
 export const DRONE_ORBIT_RADIUS_MAX = 15;
 export const DRONE_ORBIT_ANGULAR_SPEED = 0.88;
+export const DRONE_ORBITER_RADIUS_MULT = 1.22;
+export const DRONE_ORBITER_ANGULAR_MULT = 0.68;
+export const DRONE_ORBITER_LINEAR_DAMPING = 0.28;
+/** Chaser: algo más rápido que la base. */
+export const DRONE_CHASER_SPEED_MULT = 1.2;
 
 /** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
 export const PLAYER_HIT_RADIUS = 0.64;
