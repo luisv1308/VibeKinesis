@@ -565,6 +565,8 @@ const projectileMeshes = [];
 const enemyProjectiles = [];
 
 let createEnemyProjectileRef = () => {};
+/** Asignado tras `fusionCameraShake` (feedback élite). */
+let addEliteCombatShake = () => {};
 const {
   drones,
   randomSpawnPointAroundPlayer,
@@ -580,6 +582,7 @@ const {
   playerTarget,
   getCubeMeshes: () => cubeMeshes,
   createEnemyProjectile: (...a) => createEnemyProjectileRef(...a),
+  addCombatShake: (amp) => addEliteCombatShake(amp),
   onDroneKill(drone, { requestEliteSpawn }) {
     enemiesDefeated += 1;
     if (!drone.elite) {
@@ -1449,6 +1452,11 @@ const fusionExplosionTriggers = [];
 const fusionParticleBursts = [];
 const fusionExplosionLights = [];
 let fusionCameraShake = { x: 0, y: 0, z: 0 };
+addEliteCombatShake = (amp = 0.55) => {
+  fusionCameraShake.x += (Math.random() - 0.5) * 2 * amp;
+  fusionCameraShake.y += (Math.random() - 0.5) * 1.2 * amp;
+  fusionCameraShake.z += (Math.random() - 0.5) * 2 * amp;
+};
 /** Esfera invisible (solo THREE): escala con el radio del barrido de daño. */
 const COMBO_EXPLOSION_PROBE_GEO = new THREE.SphereGeometry(1, 22, 16);
 const COMBO_EXPLOSION_PROBE_MAT = new THREE.MeshBasicMaterial({
@@ -1884,10 +1892,20 @@ function removeProjectile(ent) {
   scene.remove(ent.group);
 }
 
-function createEnemyProjectile(ox, oy, oz, tx, ty, tz) {
-  const dx = tx - ox;
-  const dy = ty - oy;
-  const dz = tz - oz;
+function createEnemyProjectile(ox, oy, oz, tx, ty, tz, opts = {}) {
+  const speedMult = opts.speedMult ?? 1;
+  const jitter = opts.jitter ?? 0;
+  let jtx = tx;
+  let jty = ty;
+  let jtz = tz;
+  if (jitter > 0) {
+    jtx += (Math.random() - 0.5) * 2 * jitter;
+    jty += (Math.random() - 0.5) * 2 * jitter;
+    jtz += (Math.random() - 0.5) * 2 * jitter;
+  }
+  const dx = jtx - ox;
+  const dy = jty - oy;
+  const dz = jtz - oz;
   const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
   let nx;
   let ny;
@@ -1947,11 +1965,8 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz) {
   });
   body.addShape(shape);
 
-  body.velocity.set(
-    nx * PROJ_ENEMY_SPEED,
-    ny * PROJ_ENEMY_SPEED,
-    nz * PROJ_ENEMY_SPEED
-  );
+  const sp = PROJ_ENEMY_SPEED * speedMult;
+  body.velocity.set(nx * sp, ny * sp, nz * sp);
 
   const ent = {
     group,
@@ -1962,6 +1977,8 @@ function createEnemyProjectile(ox, oy, oz, tx, ty, tz) {
     age: 0,
     pathTraveled: 0,
     dead: false,
+    /** Multiplicador respecto a PROJ_ENEMY_SPEED (disparos élite / tuning). */
+    enemySpeedScale: speedMult,
     /** Dirección de vuelo fija (sin gravedad; se re-aplica cada frame). */
     enemyDir: { x: nx, y: ny, z: nz },
   };
@@ -2196,7 +2213,8 @@ function updateProjectileLife(dt) {
     if (grabbedBody !== ent.body && !ent.bubbleMode) {
       let spd;
       if (ent.plasmaDir) spd = PROJ_PLASMA_SPEED;
-      else if (ent.state === 'enemy' && ent.enemyDir) spd = PROJ_ENEMY_SPEED;
+      else if (ent.state === 'enemy' && ent.enemyDir)
+        spd = PROJ_ENEMY_SPEED * (ent.enemySpeedScale ?? 1);
       else if (ent.friendlyFlightDir)
         spd =
           ent.friendlyFlightSpeed ??
@@ -2258,7 +2276,7 @@ function enforceEnemyProjectileStraightFlight() {
     if (ent.state === 'enemy' && ent.enemyDir) {
       const d = ent.enemyDir;
       const b = ent.body;
-      const sp = PROJ_ENEMY_SPEED;
+      const sp = PROJ_ENEMY_SPEED * (ent.enemySpeedScale ?? 1);
       const vyPhys = b.velocity.y;
       b.velocity.set(d.x * sp, d.y * sp, d.z * sp);
       b.velocity.y = THREE.MathUtils.lerp(d.y * sp, vyPhys, blend);

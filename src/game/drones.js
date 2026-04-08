@@ -8,26 +8,41 @@ import {
   DRONE_ATTACK_MAX_DIST,
   DRONE_ATTACK_MIN_DIST,
   DRONE_ATTACKING_EMISSIVE_BOOST,
+  DRONE_BLOCK_DIST,
   DRONE_BURST_COUNT,
   DRONE_BURST_SHOT_DELAY,
   DRONE_CHASER_SPEED_MULT,
   DRONE_CLOSE_CHASE_RADIUS,
   DRONE_COORD_HOLD_SPEED_MULT,
   DRONE_DEATH_SHRINK_SPEED,
+  DRONE_ELITE_BURST_RAYS,
+  DRONE_ELITE_BURST_SPEED_MULT,
+  DRONE_ELITE_CHARGE_DURATION,
+  DRONE_ELITE_CHARGE_SPEED,
+  DRONE_ELITE_CHARGE_TELEGRAPH,
+  DRONE_ELITE_HP,
+  DRONE_ELITE_SNIPER_COOLDOWN,
+  DRONE_ELITE_SNIPER_SHOT_SPEED_MULT,
+  DRONE_ELITE_TELEGRAPH_TIME,
+  DRONE_FLANK_OFFSET,
   DRONE_FIRE_COOLDOWN,
   DRONE_FLASH_SEC,
   DRONE_LINEAR_DAMPING,
   DRONE_MAX_CLOSE_CHASERS,
+  DRONE_MAX_SIMULTANEOUS_ATTACKERS,
   DRONE_MAX_SPEED,
   DRONE_MASS,
   DRONE_ORBIT_RADIUS_MAX,
   DRONE_ORBIT_RADIUS_MIN,
   DRONE_ORBITER_LINEAR_DAMPING,
   DRONE_ORBITER_RADIUS_MULT,
+  DRONE_PACE_MOVE_MIN,
+  DRONE_PACE_PAUSE_MIN,
   DRONE_PERSONAL_OFFSET_RANGE,
   DRONE_RADIUS,
   DRONE_SEPARATION_RADIUS,
   DRONE_SEPARATION_WEIGHT,
+  DRONE_SHOOTER_AIM_JITTER,
   DRONE_SHOOTER_FLEE_BOOST,
   DRONE_SHOOTER_FIRE_MAX_DIST,
   DRONE_SHOOTER_FIRE_MIN_DIST,
@@ -35,6 +50,9 @@ import {
   DRONE_SHOOTER_AIM_TIME,
   DRONE_SHOOTER_PHASE_COOLDOWN,
   DRONE_SHOOTER_SPEED,
+  DRONE_SURROUND_MIN,
+  DRONE_SURROUND_RING_BLEND,
+  DRONE_SURROUND_RING_R,
   DRONE_TYPE_CHASER,
   DRONE_TYPE_ORBITER,
   DRONE_TYPE_SHOOTER,
@@ -54,6 +72,7 @@ export function createDronesSystem(deps) {
     playerTarget,
     getCubeMeshes,
     createEnemyProjectile,
+    addCombatShake = () => {},
     onDroneKill,
   } = deps;
 
@@ -71,12 +90,52 @@ export function createDronesSystem(deps) {
   /** @type {object[]} */
   const drones = [];
   let nextDroneId = 1;
+  let lastPx = 0;
+  let lastPz = 0;
+  let haveLastPlayer = false;
+
+  function isShotBlocked(drone, b, px, py, pz) {
+    const mx = (b.position.x + px) * 0.5;
+    const mz = (b.position.z + pz) * 0.5;
+    for (const other of drones) {
+      if (other === drone || other.dying) continue;
+      const ox = other.body.position.x;
+      const oz = other.body.position.z;
+      const dx = ox - mx;
+      const dz = oz - mz;
+      if (dx * dx + dz * dz < 6.25) return true;
+    }
+    return false;
+  }
 
   function pickBehaviorType() {
     const r = Math.random();
     if (r < 0.45) return DRONE_TYPE_CHASER;
     if (r < 0.8) return DRONE_TYPE_ORBITER;
     return DRONE_TYPE_SHOOTER;
+  }
+
+  function pickEliteVariant() {
+    const r = Math.random();
+    if (r < 0.34) return 'sniper';
+    if (r < 0.67) return 'burst';
+    return 'charger';
+  }
+
+  function applyEliteVariantMaterial(mat, variant) {
+    if (variant === 'sniper') {
+      mat.color.setHex(0x5599ff);
+      mat.emissive.setHex(0x2244aa);
+      mat.emissiveIntensity = 2.35;
+    } else if (variant === 'burst') {
+      mat.color.setHex(0xff5533);
+      mat.emissive.setHex(0x881100);
+      mat.emissiveIntensity = 2.35;
+    } else {
+      mat.color.setHex(0xffcc22);
+      mat.emissive.setHex(0x886600);
+      mat.emissiveIntensity = 2.35;
+    }
   }
 
   /** Colores estilo Pac-Man: chaser rojo, orbiter cyan, shooter naranja. */
@@ -118,6 +177,7 @@ export function createDronesSystem(deps) {
 
   function createDrone(x, y, z, opts = {}) {
     const elite = opts.elite === true;
+    const eliteVariant = elite ? opts.eliteVariant ?? pickEliteVariant() : null;
     const behaviorType = elite
       ? DRONE_TYPE_CHASER
       : opts.behaviorType ?? pickBehaviorType();
@@ -129,10 +189,14 @@ export function createDronesSystem(deps) {
       emissive: 0xff0505,
       emissiveIntensity: 1.35,
     });
-    const baseEmissiveIntensity = elite ? 1.7 : 1.35;
-    if (elite) {
+    let baseEmissiveIntensity = 1.35;
+    if (elite && eliteVariant) {
+      applyEliteVariantMaterial(mat, eliteVariant);
+      baseEmissiveIntensity = mat.emissiveIntensity;
+    } else if (elite) {
       mat.color.setHex(0x5a4868);
       mat.emissive.setHex(0x7722ff);
+      baseEmissiveIntensity = 1.7;
       mat.emissiveIntensity = baseEmissiveIntensity;
     } else {
       applyArcadeDroneMaterial(mat, behaviorType);
@@ -141,7 +205,9 @@ export function createDronesSystem(deps) {
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     mesh.position.set(x, y, z);
-    if (elite) {
+    const meshBaseScale = elite ? (eliteVariant ? 1.12 : 1.05) : 1;
+    mesh.scale.setScalar(meshBaseScale);
+    if (elite && !eliteVariant) {
       const shield = new THREE.Mesh(eliteShieldGeo, eliteShieldMat);
       shield.scale.setScalar(1.26);
       mesh.add(shield);
@@ -170,11 +236,23 @@ export function createDronesSystem(deps) {
         : behaviorType === DRONE_TYPE_ORBITER
           ? 'orbiting'
           : 'chasing';
+    const id = nextDroneId++;
     const drone = {
-      id: nextDroneId++,
+      id,
       mesh,
       body,
       elite,
+      eliteVariant,
+      eliteHp: elite ? DRONE_ELITE_HP : 0,
+      eliteAiState: elite && eliteVariant ? 'reposition' : null,
+      eliteStateTimer: 0,
+      telegraphTimer: 0,
+      chargeTimer: 0,
+      tacticalRole: 'pressure',
+      pacePhase: 'move',
+      paceTimer: 0.35 + (id % 7) * 0.09,
+      speedJitter: 0.92 + Math.random() * 0.14,
+      meshBaseScale,
       behaviorType,
       aiState,
       stateTimer: 0,
@@ -201,6 +279,10 @@ export function createDronesSystem(deps) {
         ? CUBE_KILL_DRONE_SPEED * 0.48
         : CUBE_KILL_DRONE_SPEED;
       if (other.velocity.length() < needSpeed) return;
+      if (drone.elite && drone.eliteHp > 0) {
+        drone.eliteHp -= 1;
+        if (drone.eliteHp > 0) return;
+      }
       killDrone(drone);
     });
 
@@ -215,7 +297,7 @@ export function createDronesSystem(deps) {
   function killDrone(drone, opts = {}) {
     const allowElite = opts.allowEliteKill === true;
     if (drone.dying) return;
-    if (drone.elite && !allowElite) return;
+    if (drone.elite && !allowElite && drone.eliteHp > 0) return;
     drone.dying = true;
     drone.deathPhase = 0;
     world.removeBody(drone.body);
@@ -240,6 +322,12 @@ export function createDronesSystem(deps) {
     const py = pt.y;
     const pz = pt.z;
 
+    const pvx = haveLastPlayer ? (px - lastPx) / Math.max(dt, 1e-5) : 0;
+    const pvz = haveLastPlayer ? (pz - lastPz) / Math.max(dt, 1e-5) : 0;
+    lastPx = px;
+    lastPz = pz;
+    haveLastPlayer = true;
+
     const orbiters = [];
     for (const d of drones) {
       if (!d.dying && d.behaviorType === DRONE_TYPE_ORBITER) orbiters.push(d);
@@ -247,6 +335,23 @@ export function createDronesSystem(deps) {
     orbiters.sort((a, b) => a.id - b.id);
     const nOrb = orbiters.length;
     for (let i = 0; i < nOrb; i++) orbiters[i]._orbitSlot = i;
+
+    const chasersT = [];
+    for (const d of drones) {
+      if (!d.dying && d.behaviorType === DRONE_TYPE_CHASER && !d.elite)
+        chasersT.push(d);
+    }
+    chasersT.sort((a, b) => a.id - b.id);
+    const nChT = chasersT.length;
+    for (let i = 0; i < nChT; i++) {
+      const ch = chasersT[i];
+      if (nChT >= DRONE_SURROUND_MIN) {
+        ch.tacticalRole = 'surround';
+        ch._surroundSlot = i;
+      } else {
+        ch.tacticalRole = (['pressure', 'flank', 'block'])[i % 3];
+      }
+    }
 
     const chaserNear = [];
     for (const d of drones) {
@@ -263,8 +368,51 @@ export function createDronesSystem(deps) {
       chaserNear.slice(0, DRONE_MAX_CLOSE_CHASERS).map((x) => x.d)
     );
 
-    const fire = (b) =>
+    const attackCandidates = [];
+    for (const d of drones) {
+      if (d.dying || d.elite) continue;
+      const b = d.body;
+      const dxP = px - b.position.x;
+      const dyP = py - b.position.y;
+      const dzP = pz - b.position.z;
+      const dist = Math.sqrt(dxP * dxP + dyP * dyP + dzP * dzP);
+      if (d.behaviorType === DRONE_TYPE_SHOOTER) {
+        if (
+          dist >= DRONE_SHOOTER_FIRE_MIN_DIST &&
+          dist <= DRONE_SHOOTER_FIRE_MAX_DIST
+        ) {
+          attackCandidates.push({ d, dist });
+        }
+      } else if (
+        dist >= DRONE_ATTACK_MIN_DIST &&
+        dist <= DRONE_ATTACK_MAX_DIST
+      ) {
+        attackCandidates.push({ d, dist });
+      }
+    }
+    attackCandidates.sort((a, b) => a.dist - b.dist);
+    const attackAllowed = new Set(
+      attackCandidates
+        .slice(0, DRONE_MAX_SIMULTANEOUS_ATTACKERS)
+        .map((x) => x.d)
+    );
+
+    const fireBasic = (b) =>
       createEnemyProjectile(b.position.x, b.position.y, b.position.z, px, py, pz);
+
+    const fireShooter = (drone, b) => {
+      if (!attackAllowed.has(drone)) return;
+      if (isShotBlocked(drone, b, px, py, pz)) return;
+      createEnemyProjectile(
+        b.position.x,
+        b.position.y,
+        b.position.z,
+        px,
+        py,
+        pz,
+        { jitter: DRONE_SHOOTER_AIM_JITTER }
+      );
+    };
 
     for (const d of drones) {
       if (d.dying) continue;
@@ -283,13 +431,13 @@ export function createDronesSystem(deps) {
         distToPlayer >= DRONE_SHOOTER_FIRE_MIN_DIST &&
         distToPlayer <= DRONE_SHOOTER_FIRE_MAX_DIST;
 
-      if (d.behaviorType !== DRONE_TYPE_SHOOTER) {
+      if (d.behaviorType !== DRONE_TYPE_SHOOTER && !d.elite) {
         d.aimInAttackBand = inAttackBand;
-        if (inAttackBand) {
+        if (inAttackBand && attackAllowed.has(d)) {
           d.shootTimer += dt;
           if (d.shootTimer >= DRONE_FIRE_COOLDOWN) {
             d.shootTimer = 0;
-            fire(b);
+            fireBasic(b);
           }
         } else {
           d.shootTimer = 0;
@@ -301,6 +449,105 @@ export function createDronesSystem(deps) {
       const hdx = b.position.x - px;
       const hdz = b.position.z - pz;
       const hDist = Math.sqrt(hdx * hdx + hdz * hdz);
+
+      if (d.elite && d.eliteVariant) {
+        const v = d.eliteVariant;
+        const inRange =
+          distToPlayer >= DRONE_ATTACK_MIN_DIST &&
+          distToPlayer <= DRONE_ATTACK_MAX_DIST;
+        if (v === 'sniper') {
+          if (!inRange) {
+            d.eliteAiState = 'reposition';
+            d.telegraphTimer = 0;
+          } else if (d.eliteAiState === 'reposition' && hDist > 8) {
+            d.eliteAiState = 'aim';
+            d.eliteStateTimer = 0.22;
+          } else if (d.eliteAiState === 'aim') {
+            d.eliteStateTimer -= dt;
+            if (d.eliteStateTimer <= 0) {
+              d.eliteAiState = 'telegraph';
+              d.telegraphTimer = DRONE_ELITE_TELEGRAPH_TIME;
+            }
+          } else if (d.eliteAiState === 'telegraph') {
+            d.telegraphTimer -= dt;
+            if (d.telegraphTimer <= 0) {
+              createEnemyProjectile(
+                b.position.x,
+                b.position.y,
+                b.position.z,
+                px,
+                py,
+                pz,
+                {
+                  speedMult: DRONE_ELITE_SNIPER_SHOT_SPEED_MULT,
+                  jitter: 0.03,
+                }
+              );
+              addCombatShake(0.5);
+              d.eliteAiState = 'cooldown';
+              d.eliteStateTimer = DRONE_ELITE_SNIPER_COOLDOWN;
+            }
+          } else if (d.eliteAiState === 'cooldown') {
+            d.eliteStateTimer -= dt;
+            if (d.eliteStateTimer <= 0) d.eliteAiState = 'reposition';
+          }
+        } else if (v === 'burst') {
+          if (!inRange) {
+            d.eliteAiState = 'reposition';
+          } else if (d.eliteAiState === 'reposition' && hDist > 9) {
+            d.eliteAiState = 'telegraph';
+            d.telegraphTimer = DRONE_ELITE_TELEGRAPH_TIME;
+          } else if (d.eliteAiState === 'telegraph') {
+            d.telegraphTimer -= dt;
+            if (d.telegraphTimer <= 0) {
+              const ox0 = b.position.x;
+              const oy0 = b.position.y;
+              const oz0 = b.position.z;
+              const n = DRONE_ELITE_BURST_RAYS;
+              for (let k = 0; k < n; k++) {
+                const ang = (k / n) * Math.PI * 2;
+                const txb = ox0 + Math.cos(ang) * 12;
+                const tzb = oz0 + Math.sin(ang) * 12;
+                createEnemyProjectile(ox0, oy0, oz0, txb, py, tzb, {
+                  speedMult: DRONE_ELITE_BURST_SPEED_MULT,
+                });
+              }
+              addCombatShake(0.65);
+              d.eliteAiState = 'cooldown';
+              d.eliteStateTimer = DRONE_ELITE_SNIPER_COOLDOWN;
+            }
+          } else if (d.eliteAiState === 'cooldown') {
+            d.eliteStateTimer -= dt;
+            if (d.eliteStateTimer <= 0) d.eliteAiState = 'reposition';
+          }
+        } else if (v === 'charger') {
+          if (d.eliteAiState === 'charging') {
+            d.chargeTimer -= dt;
+            if (d.chargeTimer <= 0) {
+              d.eliteAiState = 'cooldown';
+              d.eliteStateTimer = 2.1;
+            }
+          } else if (d.eliteAiState === 'cooldown') {
+            d.eliteStateTimer -= dt;
+            if (d.eliteStateTimer <= 0) d.eliteAiState = 'reposition';
+          } else if (!inRange) {
+            d.eliteAiState = 'reposition';
+          } else if (d.eliteAiState === 'reposition' && hDist < 14 && hDist > 0.08) {
+            d.eliteAiState = 'telegraph';
+            d.telegraphTimer = DRONE_ELITE_CHARGE_TELEGRAPH;
+          } else if (d.eliteAiState === 'telegraph') {
+            d.telegraphTimer -= dt;
+            if (d.telegraphTimer <= 0) {
+              d.eliteAiState = 'charging';
+              d.chargeTimer = DRONE_ELITE_CHARGE_DURATION;
+              addCombatShake(0.35);
+            }
+          }
+        }
+        d.aimInAttackBand =
+          distToPlayer >= DRONE_ATTACK_MIN_DIST &&
+          distToPlayer <= DRONE_ATTACK_MAX_DIST;
+      }
 
       if (d.behaviorType === DRONE_TYPE_SHOOTER) {
         d.aimInAttackBand = inShooterFireRange;
@@ -317,7 +564,8 @@ export function createDronesSystem(deps) {
             hDist <= DRONE_SHOOTER_FIRE_MAX_DIST + 1.2;
           if (okBand) {
             d.aiState = 'aiming';
-            d.stateTimer = DRONE_SHOOTER_AIM_TIME;
+            d.stateTimer =
+              DRONE_SHOOTER_AIM_TIME * (0.88 + Math.random() * 0.2);
           }
         } else if (d.aiState === 'aiming') {
           d.stateTimer -= dt;
@@ -330,7 +578,7 @@ export function createDronesSystem(deps) {
           if (d.burstRemaining > 0) {
             d.burstGapT -= dt;
             if (d.burstGapT <= 0) {
-              fire(b);
+              fireShooter(d, b);
               d.burstRemaining -= 1;
               if (d.burstRemaining > 0) {
                 d.burstGapT = DRONE_BURST_SHOT_DELAY;
@@ -343,6 +591,17 @@ export function createDronesSystem(deps) {
         } else if (d.aiState === 'cooldown') {
           d.stateTimer -= dt;
           if (d.stateTimer <= 0) d.aiState = 'repositioning';
+        }
+      }
+
+      if (d.behaviorType === DRONE_TYPE_CHASER && !d.elite) {
+        d.paceTimer -= dt;
+        if (d.paceTimer <= 0) {
+          d.pacePhase = d.pacePhase === 'move' ? 'pause' : 'move';
+          d.paceTimer =
+            d.pacePhase === 'pause'
+              ? DRONE_PACE_PAUSE_MIN + Math.random() * 0.18
+              : DRONE_PACE_MOVE_MIN + Math.random() * 0.28;
         }
       }
 
@@ -383,6 +642,31 @@ export function createDronesSystem(deps) {
             tx = px + hdx * inv * ideal + ox * 0.45;
             tz = pz + hdz * inv * ideal + oz * 0.45;
           }
+        } else if (d.elite && d.eliteVariant) {
+          const v = d.eliteVariant;
+          if (v === 'charger' && d.eliteAiState === 'charging') {
+            moveSpeed = DRONE_ELITE_CHARGE_SPEED;
+            if (hDist > 0.08) {
+              const inv = 1 / hDist;
+              tx = px + hdx * inv * 1;
+              tz = pz + hdz * inv * 1;
+            }
+          } else {
+            if (
+              d.eliteAiState === 'telegraph' ||
+              d.eliteAiState === 'aim' ||
+              (v === 'charger' && d.eliteAiState === 'telegraph')
+            ) {
+              moveSpeed = 0;
+            } else if (d.eliteAiState === 'cooldown') {
+              moveSpeed *= 0.42;
+            }
+            if (hDist > 0.08) {
+              const inv = 1 / hDist;
+              tx = px + hdx * inv * 17;
+              tz = pz + hdz * inv * 17;
+            }
+          }
         } else {
           let coordHold = false;
           if (
@@ -395,20 +679,105 @@ export function createDronesSystem(deps) {
           } else if (bt === DRONE_TYPE_CHASER) {
             d.aiState = 'chasing';
           }
-          moveSpeed *= DRONE_CHASER_SPEED_MULT;
+          moveSpeed *= DRONE_CHASER_SPEED_MULT * d.speedJitter;
+          let roleApplied = false;
+          if (
+            bt === DRONE_TYPE_CHASER &&
+            !coordHold &&
+            nChT >= DRONE_SURROUND_MIN &&
+            d.tacticalRole === 'surround'
+          ) {
+            const idx = d._surroundSlot ?? 0;
+            const a = (idx / Math.max(nChT, 1)) * Math.PI * 2;
+            const Rs = DRONE_SURROUND_RING_R;
+            let sx = px + Math.cos(a) * Rs;
+            let sz = pz + Math.sin(a) * Rs;
+            sx += (px - sx) * DRONE_SURROUND_RING_BLEND;
+            sz += (pz - sz) * DRONE_SURROUND_RING_BLEND;
+            tx = sx;
+            tz = sz;
+            roleApplied = true;
+          } else if (
+            bt === DRONE_TYPE_CHASER &&
+            !coordHold &&
+            d.tacticalRole === 'flank'
+          ) {
+            const plen = Math.sqrt(pvx * pvx + pvz * pvz);
+            if (plen > 0.55) {
+              const invp = 1 / plen;
+              const perpX = -pvz * invp;
+              const perpZ = pvx * invp;
+              const sign = d.id % 2 === 0 ? 1 : -1;
+              tx = px + perpX * DRONE_FLANK_OFFSET * sign + hdx * 0.18;
+              tz = pz + perpZ * DRONE_FLANK_OFFSET * sign + hdz * 0.18;
+            } else if (hDist > 0.1) {
+              const inv = 1 / hDist;
+              tx = px + (-hdz * inv) * DRONE_FLANK_OFFSET * (d.id % 2 === 0 ? 1 : -1);
+              tz = pz + (hdx * inv) * DRONE_FLANK_OFFSET * (d.id % 2 === 0 ? 1 : -1);
+            }
+            roleApplied = true;
+          } else if (
+            bt === DRONE_TYPE_CHASER &&
+            !coordHold &&
+            d.tacticalRole === 'block'
+          ) {
+            const plen = Math.sqrt(pvx * pvx + pvz * pvz);
+            if (plen > 0.45) {
+              const invp = 1 / plen;
+              tx = px + pvx * invp * DRONE_BLOCK_DIST;
+              tz = pz + pvz * invp * DRONE_BLOCK_DIST;
+            } else {
+              const tcx = -px;
+              const tcz = -pz;
+              const tl = Math.sqrt(tcx * tcx + tcz * tcz);
+              if (tl > 0.2) {
+                tx = px + (tcx / tl) * DRONE_BLOCK_DIST;
+                tz = pz + (tcz / tl) * DRONE_BLOCK_DIST;
+              }
+            }
+            roleApplied = true;
+          }
           if (coordHold) {
             moveSpeed *= DRONE_COORD_HOLD_SPEED_MULT;
             const holdR = DRONE_CLOSE_CHASE_RADIUS + 6.2;
             const spread = (d.id * 2.399963229728653) % (Math.PI * 2);
             tx = px + Math.cos(spread) * holdR;
             tz = pz + Math.sin(spread) * holdR;
-          } else if (hDist > 0.08 && distToPlayer < DRONE_ATTACK_MIN_DIST) {
+          } else if (
+            !roleApplied &&
+            hDist > 0.08 &&
+            distToPlayer < DRONE_ATTACK_MIN_DIST
+          ) {
             const inv = 1 / hDist;
             const ringR = DRONE_ATTACK_MIN_DIST + 2;
             tx = px + hdx * inv * ringR;
             tz = pz + hdz * inv * ringR;
           }
+          if (
+            d.behaviorType === DRONE_TYPE_CHASER &&
+            d.pacePhase === 'pause' &&
+            !coordHold
+          ) {
+            moveSpeed *= 0.38;
+          }
         }
+      }
+
+      if (
+        d.elite &&
+        d.eliteVariant === 'charger' &&
+        d.eliteAiState === 'charging'
+      ) {
+        if (hDist > 0.08) {
+          const inv = 1 / hDist;
+          b.velocity.x = hdx * inv * DRONE_ELITE_CHARGE_SPEED;
+          b.velocity.z = hdz * inv * DRONE_ELITE_CHARGE_SPEED;
+        } else {
+          b.velocity.x = 0;
+          b.velocity.z = 0;
+        }
+        b.velocity.y = 0;
+        continue;
       }
 
       let tdx = tx - b.position.x;
@@ -494,11 +863,22 @@ export function createDronesSystem(deps) {
       b.position.y = r;
       b.velocity.y = 0;
       d.mesh.position.copy(b.position);
-      if (!d.elite && d.behaviorType === DRONE_TYPE_SHOOTER) {
+      const baseSc = d.meshBaseScale ?? 1;
+      if (d.telegraphTimer > 0) {
+        const pulse = 1 + 0.1 * Math.sin(performance.now() * 0.024 + d.id);
+        d.mesh.scale.setScalar(baseSc * pulse);
+      } else {
+        d.mesh.scale.setScalar(baseSc);
+      }
+      if (d.elite && d.eliteVariant && d.telegraphTimer > 0) {
+        d.mesh.material.emissiveIntensity = d.baseEmissiveIntensity + 1.15;
+      } else if (!d.elite && d.behaviorType === DRONE_TYPE_SHOOTER) {
         const atk =
           d.aiState === 'aiming' || d.aiState === 'attacking';
         d.mesh.material.emissiveIntensity =
           d.baseEmissiveIntensity + (atk ? DRONE_ATTACKING_EMISSIVE_BOOST : 0);
+      } else if (d.elite && d.eliteVariant) {
+        d.mesh.material.emissiveIntensity = d.baseEmissiveIntensity;
       }
       if (d.aimInAttackBand) {
         d.mesh.lookAt(playerTarget.position);

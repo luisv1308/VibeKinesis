@@ -70,6 +70,27 @@ export const DRONE_SHOOTER_PHASE_COOLDOWN = 2.0;
 /** Bonus de emissive al apuntar/disparar (tiradores). */
 export const DRONE_ATTACKING_EMISSIVE_BOOST = 0.65;
 
+/** --- IA V3: roles, rodeo, presupuesto de ataque, élite */
+export const DRONE_SURROUND_MIN = 5;
+export const DRONE_SURROUND_RING_R = 14.5;
+export const DRONE_SURROUND_RING_BLEND = 0.28;
+export const DRONE_FLANK_OFFSET = 9.5;
+export const DRONE_BLOCK_DIST = 11;
+export const DRONE_MAX_SIMULTANEOUS_ATTACKERS = 2;
+export const DRONE_SHOOTER_AIM_JITTER = 0.85;
+/** Élite: telegráfico antes de ataque fuerte (s). */
+export const DRONE_ELITE_TELEGRAPH_TIME = 0.55;
+export const DRONE_ELITE_SNIPER_COOLDOWN = 2.4;
+export const DRONE_ELITE_SNIPER_SHOT_SPEED_MULT = 1.82;
+export const DRONE_ELITE_BURST_RAYS = 6;
+export const DRONE_ELITE_BURST_SPEED_MULT = 1.15;
+export const DRONE_ELITE_CHARGE_TELEGRAPH = 0.6;
+export const DRONE_ELITE_CHARGE_SPEED = 26;
+export const DRONE_ELITE_CHARGE_DURATION = 0.48;
+export const DRONE_ELITE_HP = 3;
+export const DRONE_PACE_PAUSE_MIN = 0.28;
+export const DRONE_PACE_MOVE_MIN = 0.75;
+
 /** Un poco generoso: balas rápidas a veces “atravesaban” la hitbox en un paso de física. */
 export const PLAYER_HIT_RADIUS = 0.64;
 
