@@ -76,7 +76,10 @@ export const DRONE_SURROUND_RING_R = 14.5;
 export const DRONE_SURROUND_RING_BLEND = 0.28;
 export const DRONE_FLANK_OFFSET = 9.5;
 export const DRONE_BLOCK_DIST = 11;
-export const DRONE_MAX_SIMULTANEOUS_ATTACKERS = 2;
+/** Máximo de drones que pueden disparar a la vez (slots globales). */
+export const DRONE_MAX_SIMULTANEOUS_ATTACKERS = 3;
+/** Cuántos de esos slots pueden ocupar tiradores (el resto: chaser/orbiter). */
+export const DRONE_MAX_ATTACK_SLOTS_SHOOTERS = 2;
 export const DRONE_SHOOTER_AIM_JITTER = 0.85;
 /** Élite: telegráfico antes de ataque fuerte (s). */
 export const DRONE_ELITE_TELEGRAPH_TIME = 0.55;

@@ -28,6 +28,7 @@ import {
   DRONE_FIRE_COOLDOWN,
   DRONE_FLASH_SEC,
   DRONE_LINEAR_DAMPING,
+  DRONE_MAX_ATTACK_SLOTS_SHOOTERS,
   DRONE_MAX_CLOSE_CHASERS,
   DRONE_MAX_SIMULTANEOUS_ATTACKERS,
   DRONE_MAX_SPEED,
@@ -440,6 +441,7 @@ export function createDronesSystem(deps) {
       burstRemaining: 0,
       burstGapT: 0,
       reloadT: 0,
+      shooterRepoTimer: 0,
     };
 
     body.addEventListener('collide', (e) => {
@@ -565,11 +567,26 @@ export function createDronesSystem(deps) {
       }
     }
     attackCandidates.sort((a, b) => a.dist - b.dist);
-    const attackAllowed = new Set(
-      attackCandidates
-        .slice(0, DRONE_MAX_SIMULTANEOUS_ATTACKERS)
-        .map((x) => x.d)
+    const slotTotal = DRONE_MAX_SIMULTANEOUS_ATTACKERS;
+    const slotShooters = Math.min(
+      DRONE_MAX_ATTACK_SLOTS_SHOOTERS,
+      slotTotal
     );
+    const shooterCand = attackCandidates.filter(
+      (x) => x.d.behaviorType === DRONE_TYPE_SHOOTER
+    );
+    const meleeCand = attackCandidates.filter(
+      (x) => x.d.behaviorType !== DRONE_TYPE_SHOOTER
+    );
+    const attackAllowed = new Set();
+    for (const x of shooterCand.slice(0, slotShooters)) {
+      if (attackAllowed.size >= slotTotal) break;
+      attackAllowed.add(x.d);
+    }
+    for (const x of meleeCand) {
+      if (attackAllowed.size >= slotTotal) break;
+      attackAllowed.add(x.d);
+    }
 
     const fireBasic = (b) =>
       createEnemyProjectile(b.position.x, b.position.y, b.position.z, px, py, pz);
@@ -732,11 +749,21 @@ export function createDronesSystem(deps) {
           d.reloadT = 0;
           d.aiState = 'repositioning';
           d.stateTimer = 0;
+          d.shooterRepoTimer = 0;
         } else if (d.aiState === 'repositioning') {
-          const okBand =
-            hDist >= DRONE_SHOOTER_FIRE_MIN_DIST * 0.82 &&
-            hDist <= DRONE_SHOOTER_FIRE_MAX_DIST + 1.2;
-          if (okBand) {
+          d.shooterRepoTimer = (d.shooterRepoTimer || 0) + dt;
+          const okBandH =
+            hDist >= DRONE_SHOOTER_FIRE_MIN_DIST * 0.62 &&
+            hDist <= DRONE_SHOOTER_FIRE_MAX_DIST + 2.2;
+          const okBand3D =
+            distToPlayer >= DRONE_SHOOTER_FIRE_MIN_DIST * 0.68 &&
+            distToPlayer <= DRONE_SHOOTER_FIRE_MAX_DIST + 1.5;
+          const forceAimFromStuck = d.shooterRepoTimer > 1.25;
+          if (
+            forceAimFromStuck ||
+            (okBand3D && (okBandH || hDist < 12))
+          ) {
+            d.shooterRepoTimer = 0;
             d.aiState = 'aiming';
             d.stateTimer =
               DRONE_SHOOTER_AIM_TIME * (0.88 + Math.random() * 0.2);
@@ -764,7 +791,10 @@ export function createDronesSystem(deps) {
           }
         } else if (d.aiState === 'cooldown') {
           d.stateTimer -= dt;
-          if (d.stateTimer <= 0) d.aiState = 'repositioning';
+          if (d.stateTimer <= 0) {
+            d.aiState = 'repositioning';
+            d.shooterRepoTimer = 0;
+          }
         }
       }
 
